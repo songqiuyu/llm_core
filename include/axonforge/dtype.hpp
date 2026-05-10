@@ -17,6 +17,7 @@ enum class DType : uint8_t {
     Q4_K_M = 10,
     Q3_K_M = 11,
     Q2_K  = 12,
+    Q6_K  = 13,
     // Integer
     I32   = 16,
     I16   = 17,
@@ -65,6 +66,7 @@ enum class DType : uint8_t {
         case DType::Q4_K_M: return "q4_k_m";
         case DType::Q3_K_M: return "q3_k_m";
         case DType::Q2_K:   return "q2_k";
+        case DType::Q6_K:   return "q6_k";
         case DType::I32:    return "i32";
         case DType::I16:    return "i16";
         case DType::I8:     return "i8";
@@ -107,6 +109,7 @@ enum class DType : uint8_t {
         case 10: return DType::Q2_K;
         case 11: return DType::Q3_K_M;
         case 12: return DType::Q4_K_M;
+        case 14: return DType::Q6_K;
         case 24: return DType::I8;
         case 25: return DType::I16;
         case 26: return DType::I32;
@@ -139,6 +142,7 @@ enum class DType : uint8_t {
         case DType::Q4_K_M: return ((n + 255) / 256) * 144;
         case DType::Q3_K_M: return ((n + 255) / 256) * 110;
         case DType::Q2_K:   return ((n + 255) / 256) * 84;
+        case DType::Q6_K:   return ((n + 255) / 256) * 210;
         default:            return 0;
     }
 }

@@ -5,6 +5,7 @@
 #include "axonforge/sampler.hpp"
 #include "loader/gguf_reader.hpp"
 #include "axonforge/models/gpt2.hpp"
+#include "axonforge/models/llama.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <memory>
@@ -138,9 +139,17 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
     return Engine(std::move(impl));
 }
 
+// Helper: is this a LLaMA-family arch string?
+static bool is_llama_arch(const std::string& arch) {
+    return arch == "llama" || arch == "llama2" || arch == "llama3"
+        || arch == "mistral" || arch == "tinyllama";
+}
+
 std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/) const {
     if (impl_->model_cfg.arch == "gpt2")
         return gpt2_encode_simple(*this, text);
+    if (is_llama_arch(impl_->model_cfg.arch))
+        return llama_encode_simple(*this, text);
     throw std::runtime_error(
         "Engine::encode: no tokenizer for arch '" + impl_->model_cfg.arch + "'");
 }
@@ -148,6 +157,10 @@ std::string Engine::decode(std::span<const int32_t> ids) const {
     if (impl_->model_cfg.arch == "gpt2") {
         std::vector<int32_t> v(ids.begin(), ids.end());
         return gpt2_decode_tokens(*this, v);
+    }
+    if (is_llama_arch(impl_->model_cfg.arch)) {
+        std::vector<int32_t> v(ids.begin(), ids.end());
+        return llama_decode_tokens(*this, v);
     }
     throw std::runtime_error(
         "Engine::decode: no tokenizer for arch '" + impl_->model_cfg.arch + "'");
@@ -190,6 +203,16 @@ std::vector<int32_t> Session::generate(
         cfg.verbose        = eng.engine_config().verbose;
         std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
         return gpt2_generate(eng, prompt, cfg);
+    }
+    if (is_llama_arch(eng.model_config().arch)) {
+        LlamaConfig cfg;
+        cfg.max_new_tokens  = max_new_tokens;
+        cfg.temperature     = smp.temperature;
+        cfg.top_k           = smp.top_k > 0 ? smp.top_k : 40;
+        cfg.verbose         = eng.engine_config().verbose;
+        cfg.max_context_len = 4096;
+        std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        return llama_generate(eng, prompt, cfg);
     }
     throw std::runtime_error(
         "Session::generate: not implemented for arch '" +
