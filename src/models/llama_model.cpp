@@ -6,8 +6,8 @@
 //
 // Key optimisations:
 //   • gemv_f16_dispatch  — AVX2+F16C GEMV via persistent ThreadPool
-//   • q4k_dot_row        — scalar Q4_K_M row dot (on-the-fly dequant)
-//   • q6k_emb_row        — Q6_K embedding row dequant
+//   • kQ4kDotRow         — runtime-selected Q4K dot: AVX2 (default) or scalar
+//   • q6k_dot_row        — scalar Q6_K row dot (on-the-fly dequant)
 //   • LlamaWeights       — pre-built Tensor* pointer table
 //   • RoPE cache         — cos/sin precomputed at model load
 // ============================================================
@@ -40,6 +40,16 @@ namespace axonforge::cpu_x86 {
     void gemv_f16_avx2_range(float* y, const uint16_t* W, const float* x,
                              const float* b,
                              int row_start, int row_end, int in_dim) noexcept;
+    // Q4K AVX2 kernel (gemv_q4k_avx2.cpp, compiled with -mavx2 -mf16c)
+    float q4k_dot_row_avx2(const uint8_t* row, const float* x, int in_dim) noexcept;
+    void  gemv_q4k_avx2_range(float* y, const uint8_t* W, const float* x,
+                               int o_start, int o_end, int in_dim,
+                               size_t row_bytes) noexcept;
+    // Q6K AVX2 kernel (gemv_q6k_avx2.cpp, compiled with -mavx2 -mf16c)
+    float q6k_dot_row_avx2(const uint8_t* row, const float* x, int in_dim) noexcept;
+    void  gemv_q6k_avx2_range(float* y, const uint8_t* W, const float* x,
+                               int o_start, int o_end, int in_dim,
+                               size_t row_bytes) noexcept;
 }
 
 namespace axonforge {
@@ -179,6 +189,23 @@ static float q4k_dot_row(const uint8_t* row, const float* x, int in_dim) noexcep
     return acc;
 }
 
+// ─── Q4K / Q6K runtime dispatch ───────────────────────────────────────────────
+// Selected once at startup based on cpu_features().avx2;
+// used by gemv_wt and any future model that calls it.
+using Q4kDotRowFn = float(*)(const uint8_t*, const float*, int) noexcept;
+static const Q4kDotRowFn kQ4kDotRow =
+    cpu_x86::cpu_features().avx2
+        ? cpu_x86::q4k_dot_row_avx2
+        : q4k_dot_row;
+
+static float q6k_dot_row(const uint8_t* row, const float* x, int in_dim) noexcept;
+
+using Q6kDotRowFn = float(*)(const uint8_t*, const float*, int) noexcept;
+static const Q6kDotRowFn kQ6kDotRow =
+    cpu_x86::cpu_features().avx2
+        ? cpu_x86::q6k_dot_row_avx2
+        : q6k_dot_row;
+
 // ─── Q6_K on-the-fly dequantisation ──────────────────────────────────────────
 // Block layout (210 bytes, QK_K=256 elements):
 //   [0:127]   ql[128]   lower 4 bits of each 6-bit quant
@@ -305,11 +332,11 @@ static void gemv_wt(float* y, const WT& W, const float* x, int out, int in,
         if (pool && out >= 32) {
             pool->parallel_for(out, [&](int s, int e) {
                 for (int o = s; o < e; o++)
-                    y[o] = q4k_dot_row(Wq + (size_t)o * row_bytes, x, in);
+                    y[o] = kQ4kDotRow(Wq + (size_t)o * row_bytes, x, in);
             });
         } else {
             for (int o = 0; o < out; o++)
-                y[o] = q4k_dot_row(Wq + (size_t)o * row_bytes, x, in);
+                y[o] = kQ4kDotRow(Wq + (size_t)o * row_bytes, x, in);
         }
     } else if (W.dtype == DType::Q6_K) {
         const uint8_t* Wq = static_cast<const uint8_t*>(W.data);
@@ -317,11 +344,11 @@ static void gemv_wt(float* y, const WT& W, const float* x, int out, int in,
         if (pool && out >= 32) {
             pool->parallel_for(out, [&](int s, int e) {
                 for (int o = s; o < e; o++)
-                    y[o] = q6k_dot_row(Wq + (size_t)o * row_bytes, x, in);
+                    y[o] = kQ6kDotRow(Wq + (size_t)o * row_bytes, x, in);
             });
         } else {
             for (int o = 0; o < out; o++)
-                y[o] = q6k_dot_row(Wq + (size_t)o * row_bytes, x, in);
+                y[o] = kQ6kDotRow(Wq + (size_t)o * row_bytes, x, in);
         }
     } else {
         // Fallback: treat as F16 (BF16 etc.)

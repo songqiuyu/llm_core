@@ -9,6 +9,8 @@ if(AXONFORGE_ENABLE_AVX2)
         kernels/gemm_avx2.cpp
         kernels/gemv_lut_avx2.cpp
         kernels/gemv_f16_avx2.cpp
+        kernels/gemv_q4k_avx2.cpp
+        kernels/gemv_q6k_avx2.cpp
         kernels/elementwise_avx2.cpp
         kernels/norm_avx2.cpp
     )

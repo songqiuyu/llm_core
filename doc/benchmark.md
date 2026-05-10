@@ -33,28 +33,27 @@
 ## 2. LLaMA Family — Results
 
 > Measured on i9-12900K, 8 threads, `-t 0.0` (greedy), prompt `"The capital of France is"`.  
-> Current backend: **scalar Q4K/Q6K** (no AVX2 quantised GEMV yet — Phase 2a target).
+> Current backend: **AVX2 Q4K + Q6K** (Phase 2b, 2026-05-10).
 
 ### TinyLlama-1.1B-Chat-v1.0 Q4_K_M
 
-| Metric | AxonForge (scalar) | llama.cpp Q4_K_M ref |
-|--------|-------------------|----------------------|
-| Precision | Q4_K_M | Q4_K_M |
-| TTFT (6-token prompt) | ~4900 ms | ~35 ms |
-| **tok/s** | **~0.96** | ~26 tok/s |
-| Output sample | `the city of Paris, which is the capital of France.` | — |
+| Metric | AxonForge Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
+|--------|--------------------|-----------|--------------------|---------------|
+| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
+| TTFT (6-token prompt) | **~334 ms** | ~1024 ms | ~4900 ms | ~35 ms |
+| **tok/s** | **~14.8** | ~4.96 | ~0.96 | ~26 tok/s |
+| Speedup vs scalar | **15.4×** | 5.2× | — | — |
+| Output sample | `the city of Paris, which is the capital of France.` | — | — | — |
 
 ### LLaMA-2-7B Q4_K_M
 
-| Metric | AxonForge (scalar) | llama.cpp Q4_K_M ref |
-|--------|-------------------|----------------------|
-| Precision | Q4_K_M | Q4_K_M |
-| TTFT (6-token prompt) | ~24700 ms | ~200 ms |
-| **tok/s** | **~0.18** | ~4 tok/s |
-| Output sample | `a city of contrasts. The city of Paris is a...` | — |
-
-> **Note**: AxonForge throughput is ~27× slower than llama.cpp at this stage because the Q4K GEMV is pure scalar.  
-> Phase 2a (AVX2 Q4K GEMV) is expected to recover to **~5–10 tok/s** for TinyLlama and **~1–2 tok/s** for LLaMA-2-7B.
+| Metric | AxonForge Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
+|--------|--------------------|-----------|--------------------|---------------|
+| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
+| TTFT (6-token prompt) | **~3431 ms** | ~7368 ms | ~24700 ms | ~200 ms |
+| **tok/s** | **~1.79** | ~0.65 | ~0.18 | ~4 tok/s |
+| Speedup vs scalar | **9.9×** | 3.6× | — | — |
+| Output sample | `a city of contrasts. The city of Paris is a...` | — | — | — |
 
 ### LLaMA-3.2-3B / LLaMA-3-8B
 
