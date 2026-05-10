@@ -32,34 +32,38 @@
 
 ## 2. LLaMA Family — Results
 
-> **To fill in after models are loaded** (see §4 for GGUF file locations).
+> Measured on i9-12900K, 8 threads, `-t 0.0` (greedy), prompt `"The capital of France is"`.  
+> Current backend: **scalar Q4K/Q6K** (no AVX2 quantised GEMV yet — Phase 2a target).
 
-### TinyLlama-1.1B
+### TinyLlama-1.1B-Chat-v1.0 Q4_K_M
 
-| Metric | AxonForge | llama.cpp ref (i9-12900K) |
-|--------|-----------|--------------------------|
-| Precision | F16 | F16 |
-| TTFT | _TBD_ | ~35 ms |
-| **tok/s** | **_TBD_** | ~26 tok/s |
+| Metric | AxonForge (scalar) | llama.cpp Q4_K_M ref |
+|--------|-------------------|----------------------|
+| Precision | Q4_K_M | Q4_K_M |
+| TTFT (6-token prompt) | ~4900 ms | ~35 ms |
+| **tok/s** | **~0.96** | ~26 tok/s |
+| Output sample | `the city of Paris, which is the capital of France.` | — |
 
-### LLaMA-3.2-3B
+### LLaMA-2-7B Q4_K_M
 
-| Metric | AxonForge | llama.cpp ref (i9-12900K) |
-|--------|-----------|--------------------------|
-| Precision | F16 | F16 |
-| TTFT | _TBD_ | ~120 ms |
-| **tok/s** | **_TBD_** | ~10 tok/s |
+| Metric | AxonForge (scalar) | llama.cpp Q4_K_M ref |
+|--------|-------------------|----------------------|
+| Precision | Q4_K_M | Q4_K_M |
+| TTFT (6-token prompt) | ~24700 ms | ~200 ms |
+| **tok/s** | **~0.18** | ~4 tok/s |
+| Output sample | `a city of contrasts. The city of Paris is a...` | — |
 
-### LLaMA-3-8B
+> **Note**: AxonForge throughput is ~27× slower than llama.cpp at this stage because the Q4K GEMV is pure scalar.  
+> Phase 2a (AVX2 Q4K GEMV) is expected to recover to **~5–10 tok/s** for TinyLlama and **~1–2 tok/s** for LLaMA-2-7B.
 
-| Metric | AxonForge | llama.cpp ref (i9-12900K) |
-|--------|-----------|--------------------------|
-| Precision | F16 | F16 |
-| TTFT | _TBD_ | ~350 ms |
-| **tok/s** | **_TBD_** | ~4 tok/s |
+### LLaMA-3.2-3B / LLaMA-3-8B
 
-> llama.cpp reference: official wiki "Performance" page + community benchmarks on
-> [ggml-org/llama.cpp discussions](https://github.com/ggerganov/llama.cpp/discussions).
+| Model | AxonForge | llama.cpp ref |
+|-------|-----------|---------------|
+| LLaMA-3.2-3B F16 | _TBD_ | ~10 tok/s |
+| LLaMA-3-8B F16 | _TBD_ | ~4 tok/s |
+
+> LLaMA-3 architecture support (rope_scaling, 128K vocab) not yet implemented.
 
 ---
 
@@ -80,50 +84,43 @@ LLaMA results are expected to show similar or greater advantage as the model siz
 
 ## 4. Running the Benchmark
 
-### Required GGUF Files (F16 only — quantised Q4 not yet supported)
+### Available GGUF Files
 
-| Model | File | Size | Path |
-|-------|------|------|------|
-| TinyLlama 1.1B | `TinyLlama_v1.1-F16.gguf` | 2.2 GB | `models/tinyllama-1.1B/` |
-| LLaMA-3.2-3B | `Llama-3.2-3B-F16.gguf` | 6.4 GB | `models/llama-3.2-3B/` |
-| LLaMA-3-8B | `Meta-Llama-3-8B-F16.gguf` | 16.1 GB | `models/llama-3-8B/` |
-
-Download sources:
-- `bartowski/TinyLlama_v1.1-GGUF` (HuggingFace)
-- `bartowski/Llama-3.2-3B-GGUF` (HuggingFace)
-- `bartowski/Meta-Llama-3-8B-GGUF` (HuggingFace)
+| Model | File | Size | Path | Status |
+|-------|------|------|------|--------|
+| TinyLlama-1.1B-Chat | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | ~670 MB | `models/tinyllama-1.1B/` | ✅ 可用 |
+| LLaMA-2-7B | `llama-2-7b.Q4_K_M.gguf` | ~3.8 GB | `models/llama-2-7B/` | ✅ 可用 |
+| LLaMA-3.2-3B | `Llama-3.2-3B-F16.gguf` | 6.4 GB | `models/llama-3.2-3B/` | ⏳ 未下载 |
+| LLaMA-3-8B | `Meta-Llama-3-8B-F16.gguf` | 16.1 GB | `models/llama-3-8B/` | ⏳ 未下载 |
 
 ### Benchmark Commands
 
 ```bash
-# TinyLlama 1.1B
+# TinyLlama-1.1B Q4_K_M (greedy)
 build/tools/cli/axonforge-cli \
-    -m models/tinyllama-1.1B/TinyLlama_v1.1-F16.gguf \
-    -p "The meaning of life is" -n 200 -t 0.8
+    -m models/tinyllama-1.1B/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    -p "The capital of France is" -n 20 -t 0.0
 
-# LLaMA-3.2 3B
+# LLaMA-2-7B Q4_K_M (greedy)
 build/tools/cli/axonforge-cli \
-    -m models/llama-3.2-3B/Llama-3.2-3B-F16.gguf \
-    -p "The meaning of life is" -n 200 -t 0.8
+    -m models/llama-2-7B/llama-2-7b.Q4_K_M.gguf \
+    -p "The capital of France is" -n 20 -t 0.0
 
-# LLaMA-3 8B
+# LLaMA-2-7B Q4_K_M (sampling)
 build/tools/cli/axonforge-cli \
-    -m models/llama-3-8B/Meta-Llama-3-8B-F16.gguf \
-    -p "The meaning of life is" -n 200 -t 0.8
-
-# Interactive mode
-build/tools/cli/axonforge-cli \
-    -m models/tinyllama-1.1B/TinyLlama_v1.1-F16.gguf \
-    -i -n 200 -t 0.8
+    -m models/llama-2-7B/llama-2-7b.Q4_K_M.gguf \
+    -p "Once upon a time" -n 50 -t 0.8
 ```
 
 ---
 
 ## 5. Phase 2 Roadmap (Performance Targets)
 
-| Feature | Expected gain |
-|---------|--------------|
-| Q4_K_M quantisation | 2× tok/s (bandwidth halved) |
-| AVX2 attention kernel (dot-product loop) | +3–5% |
-| GELU/SiLU polynomial approx | +1–2% |
-| CUDA backend (GTX 1080 Ti) | ~300–500 tok/s |
+| Feature | Expected gain | Status |
+|---------|--------------|--------|
+| Q4_K_M quantisation (scalar) | baseline ~1 tok/s | ✅ Done |
+| **AVX2 Q4K GEMV kernel** | **~10–20× scalar → ~5–10 tok/s** | 🔜 Next |
+| AVX2 attention dot-product | +3–5% | ⏳ |
+| SiLU polynomial approx | +1–2% | ⏳ |
+| Chat template support | usability | ⏳ |
+| CUDA backend (GTX 1080 Ti) | ~300–500 tok/s | ⏳ |

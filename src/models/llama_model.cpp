@@ -143,8 +143,8 @@ static inline void q4k_get_scale_min(int j, const uint8_t* sc,
         d = sc[j]   & 0x3F;
         m = sc[j+4] & 0x3F;
     } else {
-        d = (sc[j+4] >> 4) | ((sc[j-4] & 0xC0) >> 2);
-        m = (sc[j+0] >> 4) | ((sc[j-4] & 0xC0) >> 2);
+        d = (sc[j+4] & 0x0F) | ((sc[j-4] >> 6) << 4);
+        m = (sc[j+4] >>   4) | ((sc[j-0] >> 6) << 4);
     }
 }
 
@@ -604,6 +604,9 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
 static int sample_top_k(const float* logits, int n_vocab,
                          int top_k, float temperature,
                          std::mt19937& rng) {
+    // temperature==0 or top_k==1 → greedy argmax
+    if (temperature <= 0.f || top_k <= 1)
+        return static_cast<int>(std::max_element(logits, logits + n_vocab) - logits);
     std::vector<std::pair<float, int>> scored(n_vocab);
     for (int i = 0; i < n_vocab; i++) scored[i] = {logits[i] / temperature, i};
     if (top_k <= 1)
