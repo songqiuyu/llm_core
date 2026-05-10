@@ -3,3 +3,4 @@
 build/
 ggml/
 llama.cpp/
+models/

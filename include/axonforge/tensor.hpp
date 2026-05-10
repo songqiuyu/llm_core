@@ -43,6 +43,13 @@ public:
                                           DeviceId device = DeviceId::cpu(),
                                           bool owns = false);
 
+    // Wrap a raw pointer with an explicit byte count.
+    // Use for block-quantized types where nbytes != numel * dtype_element_size().
+    // The pointer must remain valid for the Tensor's lifetime (owns=false).
+    [[nodiscard]] static Tensor from_raw_blob(void* data, size_t nbytes,
+                                              Shape shape, DType dtype,
+                                              DeviceId device = DeviceId::cpu());
+
     // ---- Copy / move (cheap — only copies view metadata + increments refcount) ----
     Tensor(const Tensor&)            = default;
     Tensor(Tensor&&)                 = default;

@@ -117,6 +117,13 @@ Tensor Tensor::from_blob(void* data, Shape shape, DType dtype,
     return Tensor(std::move(storage), shape, contiguous_strides(shape), 0, dtype);
 }
 
+Tensor Tensor::from_raw_blob(void* data, size_t nbytes,
+                               Shape shape, DType dtype,
+                               DeviceId /*device*/) {
+    auto storage = std::make_shared<CpuTensorStorage>(data, nbytes, /*owns=*/false);
+    return Tensor(std::move(storage), shape, contiguous_strides(shape), 0, dtype);
+}
+
 // ---- Attributes ----
 
 const Shape&   Tensor::shape()   const noexcept { return shape_; }

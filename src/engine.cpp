@@ -3,8 +3,11 @@
 #include "axonforge/graph.hpp"
 #include "axonforge/kv_cache.hpp"
 #include "axonforge/sampler.hpp"
+#include "loader/gguf_reader.hpp"
+#include <cstdio>
 #include <stdexcept>
 #include <memory>
+#include <unordered_map>
 
 namespace axonforge {
 
@@ -12,11 +15,14 @@ namespace axonforge {
 // Engine::Impl — holds backend, compiled graph, weights, tokenizer.
 // ============================================================
 struct Engine::Impl {
-    EngineConfig              engine_cfg;
-    ModelConfig               model_cfg;
-    std::unique_ptr<IBackend> backend;
-    ComputeGraph              graph;
-    // TODO(Phase0): weight tensors (mmap'd from GGUF)
+    EngineConfig                           engine_cfg;
+    ModelConfig                            model_cfg;
+    std::unique_ptr<IBackend>              backend;
+    ComputeGraph                           graph;
+    std::unique_ptr<GgufReader>            gguf;       // keeps mmap alive
+    std::unordered_map<std::string,Tensor> weights;    // name → zero-copy mmap view
+    int32_t                                bos_token_id{1};
+    int32_t                                eos_token_id{2};
     // TODO(Phase0): BpeTokenizer tokenizer
 };
 
@@ -35,9 +41,84 @@ Engine::~Engine() = default;
 
 const ModelConfig&  Engine::model_config()   const noexcept { return impl_->model_cfg; }
 const EngineConfig& Engine::engine_config()  const noexcept { return impl_->engine_cfg; }
-int32_t Engine::bos_id()     const noexcept { return 1; }
-int32_t Engine::eos_id()     const noexcept { return 2; }
+int32_t Engine::bos_id()     const noexcept { return impl_->bos_token_id; }
+int32_t Engine::eos_id()     const noexcept { return impl_->eos_token_id; }
 int32_t Engine::vocab_size() const noexcept { return impl_->model_cfg.vocab_size; }
+
+Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
+    // ---- 1. Parse the GGUF file (mmap'd) ----
+    auto gguf = std::make_unique<GgufReader>();
+    gguf->open(path);  // throws on any format error
+
+    // ---- 2. Extract ModelConfig from KV metadata ----
+    ModelConfig mcfg;
+    mcfg.arch = gguf->get_str("general.architecture", "unknown");
+
+    const std::string& arch = mcfg.arch;
+    mcfg.n_layers    = static_cast<int>(gguf->get_u64(arch + ".block_count",       0));
+    mcfg.hidden_dim  = static_cast<int>(gguf->get_u64(arch + ".embedding_length",  0));
+    mcfg.ffn_dim     = static_cast<int>(gguf->get_u64(arch + ".feed_forward_length",0));
+    mcfg.n_heads     = static_cast<int>(gguf->get_u64(arch + ".attention.head_count", 0));
+    mcfg.n_kv_heads  = static_cast<int>(gguf->get_u64(arch + ".attention.head_count_kv",
+                                        static_cast<uint64_t>(mcfg.n_heads)));
+    mcfg.max_seq_len = static_cast<int>(gguf->get_u64(arch + ".context_length", 4096));
+    mcfg.rms_norm_eps= gguf->get_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    mcfg.rope_theta  = gguf->get_f32(arch + ".rope.freq_base", 10000.0f);
+
+    if (mcfg.n_heads > 0 && mcfg.hidden_dim > 0)
+        mcfg.head_dim = mcfg.hidden_dim / mcfg.n_heads;
+
+    // vocab_size = length of tokenizer.ggml.tokens array
+    const size_t vocab_count = gguf->get_array_count("tokenizer.ggml.tokens");
+    mcfg.vocab_size = static_cast<int>(vocab_count > 0 ? vocab_count : 0);
+
+    // Primary weight dtype: inspect the first tensor
+    if (gguf->n_tensors() > 0) {
+        mcfg.weight_dtype = gguf->tensor_info(0).dtype;
+    }
+
+    // ---- 3. BOS / EOS token ids ----
+    const int32_t bos_id = gguf->get_i32("tokenizer.ggml.bos_token_id", 1);
+    const int32_t eos_id = gguf->get_i32("tokenizer.ggml.eos_token_id", 2);
+
+    // ---- 4. Create and initialise backend ----
+    auto backend = BackendRegistry::instance().create(cfg.backend);
+    if (!backend->initialize()) {
+        throw std::runtime_error(
+            "Engine::from_gguf: backend '" + cfg.backend + "' failed to initialise");
+    }
+
+    // ---- 5. Build weight map (zero-copy views into mmap region) ----
+    std::unordered_map<std::string, Tensor> weights;
+    weights.reserve(gguf->n_tensors());
+    for (size_t i = 0; i < gguf->n_tensors(); ++i) {
+        const auto& ti = gguf->tensor_info(i);
+        weights.emplace(ti.name, gguf->weight_tensor(i));
+    }
+
+    // ---- 6. Assemble Engine::Impl ----
+    auto impl              = std::make_unique<Engine::Impl>();
+    impl->engine_cfg       = std::move(cfg);
+    impl->model_cfg        = std::move(mcfg);
+    impl->backend          = std::move(backend);
+    impl->gguf             = std::move(gguf);
+    impl->weights          = std::move(weights);
+    impl->bos_token_id     = bos_id;
+    impl->eos_token_id     = eos_id;
+
+    if (impl->engine_cfg.verbose) {
+        const auto& mc = impl->model_cfg;
+        std::fprintf(stderr,
+            "[AxonForge] Loaded '%.*s'  arch=%s  layers=%d  hidden=%d"
+            "  heads=%d/%d  vocab=%d  tensors=%zu\n",
+            static_cast<int>(path.size()), path.data(),
+            mc.arch.c_str(), mc.n_layers, mc.hidden_dim,
+            mc.n_heads, mc.n_kv_heads, mc.vocab_size,
+            impl->weights.size());
+    }
+
+    return Engine(std::move(impl));
+}
 
 std::vector<int32_t> Engine::encode(std::string_view, bool) const {
     throw std::runtime_error("Engine::encode: tokenizer not yet implemented");
