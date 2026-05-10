@@ -117,6 +117,14 @@ public:
     [[nodiscard]] const ModelConfig& model_config() const noexcept;
     [[nodiscard]] const EngineConfig& engine_config() const noexcept;
 
+    // ---- Weight access (zero-copy views into mmap region) ----
+    // Returns nullptr if name not found.
+    [[nodiscard]] const Tensor* weight(std::string_view name) const noexcept;
+
+    // ---- Vocabulary ----
+    // Returns the token vocabulary loaded from GGUF tokenizer.ggml.tokens.
+    [[nodiscard]] const std::vector<std::string>& vocabulary() const noexcept;
+
 private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);

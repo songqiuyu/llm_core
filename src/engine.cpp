@@ -4,6 +4,7 @@
 #include "axonforge/kv_cache.hpp"
 #include "axonforge/sampler.hpp"
 #include "loader/gguf_reader.hpp"
+#include "axonforge/models/gpt2.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <memory>
@@ -21,6 +22,7 @@ struct Engine::Impl {
     ComputeGraph                           graph;
     std::unique_ptr<GgufReader>            gguf;       // keeps mmap alive
     std::unordered_map<std::string,Tensor> weights;    // name → zero-copy mmap view
+    std::vector<std::string>               vocabulary;   // token_id → token string
     int32_t                                bos_token_id{1};
     int32_t                                eos_token_id{2};
     // TODO(Phase0): BpeTokenizer tokenizer
@@ -33,8 +35,8 @@ struct Engine::Impl {
 struct Session::Impl {
     const EngineConfig* engine_cfg{nullptr};
     const ModelConfig*  model_cfg{nullptr};
-    // TODO(Phase0): shared weight tensors pointer
-};
+    const Engine*       owner{nullptr};    // back-pointer for dispatch
+};    // TODO(Phase0): shared weight tensors pointer
 
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Engine::~Engine() = default;
@@ -44,6 +46,15 @@ const EngineConfig& Engine::engine_config()  const noexcept { return impl_->engi
 int32_t Engine::bos_id()     const noexcept { return impl_->bos_token_id; }
 int32_t Engine::eos_id()     const noexcept { return impl_->eos_token_id; }
 int32_t Engine::vocab_size() const noexcept { return impl_->model_cfg.vocab_size; }
+
+const Tensor* Engine::weight(std::string_view name) const noexcept {
+    auto it = impl_->weights.find(std::string(name));
+    return it != impl_->weights.end() ? &it->second : nullptr;
+}
+
+const std::vector<std::string>& Engine::vocabulary() const noexcept {
+    return impl_->vocabulary;
+}
 
 Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
     // ---- 1. Parse the GGUF file (mmap'd) ----
@@ -106,6 +117,13 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
     impl->bos_token_id     = bos_id;
     impl->eos_token_id     = eos_id;
 
+    // ---- Extract vocabulary from tokenizer.ggml.tokens ----
+    if (const auto* v = impl->gguf->find_value("tokenizer.ggml.tokens")) {
+        if (const auto* arr = std::get_if<GgufArray>(v)) {
+            impl->vocabulary = arr->strings;
+        }
+    }
+
     if (impl->engine_cfg.verbose) {
         const auto& mc = impl->model_cfg;
         std::fprintf(stderr,
@@ -120,17 +138,26 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
     return Engine(std::move(impl));
 }
 
-std::vector<int32_t> Engine::encode(std::string_view, bool) const {
-    throw std::runtime_error("Engine::encode: tokenizer not yet implemented");
+std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/) const {
+    if (impl_->model_cfg.arch == "gpt2")
+        return gpt2_encode_simple(*this, text);
+    throw std::runtime_error(
+        "Engine::encode: no tokenizer for arch '" + impl_->model_cfg.arch + "'");
 }
-std::string Engine::decode(std::span<const int32_t>) const {
-    throw std::runtime_error("Engine::decode: tokenizer not yet implemented");
+std::string Engine::decode(std::span<const int32_t> ids) const {
+    if (impl_->model_cfg.arch == "gpt2") {
+        std::vector<int32_t> v(ids.begin(), ids.end());
+        return gpt2_decode_tokens(*this, v);
+    }
+    throw std::runtime_error(
+        "Engine::decode: no tokenizer for arch '" + impl_->model_cfg.arch + "'");
 }
 
 Session Engine::new_session() const {
     auto s_impl = std::make_unique<Session::Impl>();
     s_impl->engine_cfg  = &impl_->engine_cfg;
     s_impl->model_cfg   = &impl_->model_cfg;
+    s_impl->owner       = this;
     return Session(std::move(s_impl));
 }
 
@@ -146,9 +173,27 @@ Tensor Session::forward(std::span<const int32_t>, KvState&) {
 }
 
 std::vector<int32_t> Session::generate(
-    std::span<const int32_t>, KvState&, const SamplerConfig&, int, int)
+    std::span<const int32_t> prompt_ids,
+    KvState&                 /*kv*/,
+    const SamplerConfig&     smp,
+    int                      max_new_tokens,
+    int                      /*eos_id*/)
 {
-    throw std::runtime_error("Session::generate: not yet implemented");
+    if (!impl_->owner)
+        throw std::runtime_error("Session::generate: no owner engine");
+    const Engine& eng = *impl_->owner;
+    if (eng.model_config().arch == "gpt2") {
+        Gpt2Config cfg;
+        cfg.max_new_tokens = max_new_tokens;
+        cfg.temperature    = smp.temperature;
+        cfg.top_k          = smp.top_k > 0 ? smp.top_k : 40;
+        cfg.verbose        = eng.engine_config().verbose;
+        std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        return gpt2_generate(eng, prompt, cfg);
+    }
+    throw std::runtime_error(
+        "Session::generate: not implemented for arch '" +
+        eng.model_config().arch + "'");
 }
 
 // ============================================================

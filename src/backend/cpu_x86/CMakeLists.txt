@@ -8,10 +8,11 @@ if(AXONFORGE_ENABLE_AVX2)
     add_library(axonforge_kernels_avx2 OBJECT
         kernels/gemm_avx2.cpp
         kernels/gemv_lut_avx2.cpp
+        kernels/gemv_f16_avx2.cpp
         kernels/elementwise_avx2.cpp
         kernels/norm_avx2.cpp
     )
-    target_compile_options(axonforge_kernels_avx2 PRIVATE -mavx2 -mfma -O3)
+    target_compile_options(axonforge_kernels_avx2 PRIVATE -mavx2 -mfma -mf16c -O3)
     target_include_directories(axonforge_kernels_avx2
         PRIVATE ${PROJECT_SOURCE_DIR}/include
                 ${CMAKE_BINARY_DIR}/include      # generated version.hpp

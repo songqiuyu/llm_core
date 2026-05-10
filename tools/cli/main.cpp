@@ -1,5 +1,7 @@
 #include "axonforge/engine.hpp"
 #include "axonforge/backend.hpp"
+#include "axonforge/models/gpt2.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,18 +110,51 @@ int main(int argc, char* argv[]) {
     std::printf("[AxonForge] Backend: %s\n", backend_id.c_str());
 
     try {
-        auto engine  = axonforge::Engine::from_gguf(model_path, eng_cfg);
-        auto session = engine.new_session();
-        auto kv      = session.new_kv_state();
+        using Clock = std::chrono::steady_clock;
+
+        auto engine = axonforge::Engine::from_gguf(model_path, eng_cfg);
 
         std::printf("[AxonForge] Prompt: %s\n\n", prompt.c_str());
 
-        auto prompt_ids = engine.encode(prompt, /*add_bos=*/true);
-        auto output_ids = session.generate(prompt_ids, kv, smp_cfg,
-                                           max_new_tokens,
-                                           engine.eos_id());
+        auto prompt_ids = engine.encode(prompt, /*add_bos=*/false);
+        std::fprintf(stderr, "[AxonForge] %zu prompt tokens\n", prompt_ids.size());
 
-        std::printf("%s\n", engine.decode(output_ids).c_str());
+        // ── Timing ──────────────────────────────────────────────────────────
+        auto t_start = Clock::now();
+        bool first_token_done = false;
+        double ttft_ms = 0.0;
+        int    n_gen   = 0;
+
+        // ── Streaming callback: print each token as it arrives ────────────
+        axonforge::Gpt2Config gcfg;
+        gcfg.max_new_tokens = max_new_tokens;
+        gcfg.temperature    = temperature;
+        gcfg.top_k          = top_k;
+
+        gcfg.on_token = [&](int32_t tok_id) {
+            if (!first_token_done) {
+                ttft_ms = std::chrono::duration<double, std::milli>(
+                              Clock::now() - t_start).count();
+                first_token_done = true;
+            }
+            n_gen++;
+            // Decode and flush immediately
+            std::string frag = axonforge::gpt2_decode_tokens(engine, {tok_id});
+            std::printf("%s", frag.c_str());
+            std::fflush(stdout);
+        };
+
+        axonforge::gpt2_generate(engine, prompt_ids, gcfg);
+
+        auto t_end = Clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(
+                              t_end - t_start).count();
+
+        std::printf("\n\n");
+        std::fprintf(stderr,
+            "[AxonForge] TTFT: %.0f ms | %d tokens | %.2f tok/s\n",
+            ttft_ms, n_gen,
+            n_gen > 0 ? n_gen / (total_ms / 1000.0) : 0.0);
 
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[AxonForge] Error: %s\n", e.what());
