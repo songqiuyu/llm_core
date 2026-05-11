@@ -105,7 +105,8 @@ static void print_usage(const char* prog) {
         "  -n <int>          Max new tokens per turn (default: 256)\n"
         "  -t <float>        Temperature (default: 0.8)\n"
         "  --top-k <int>     Top-K (default: 40)\n"
-        "  --top-p <float>   Top-P (default: 0.95)\n"
+        "  --top-p <float>   Top-P nucleus cutoff (default: 0.95)\n"
+        "  --rep-penalty <f> Repetition penalty (default: 1.1; 1.0=off)\n"
         "  -V, --verbose     Rich inference stats (throughput, RSS memory)\n"
         "  -b <id>           Backend (default: cpu_x86)\n"
         "  --list-backends   Print available backends\n"
@@ -116,13 +117,99 @@ static void print_usage(const char* prog) {
         prog, prog);
 }
 
+// ── Chat template helpers ──────────────────────────────────────────────────────────────────────────────
+
+enum class ChatFmt { Raw, Zephyr, LLaMA2, ChatML };
+
+static ChatFmt detect_chat_fmt(const std::string& tmpl) noexcept {
+    if (tmpl.empty())                                      return ChatFmt::Raw;
+    if (tmpl.find("<|im_start|>")  != std::string::npos) return ChatFmt::ChatML;
+    if (tmpl.find("<|system|>")    != std::string::npos) return ChatFmt::Zephyr;
+    if (tmpl.find("[INST]")                        != std::string::npos) return ChatFmt::LLaMA2;
+    return ChatFmt::Raw;
+}
+
+struct ChatMsg { std::string role; std::string text; };
+
+static std::string format_chat(ChatFmt fmt,
+                                const std::string& system_msg,
+                                const std::vector<ChatMsg>& history,
+                                const std::string& user_msg)
+{
+    std::string out;
+    switch (fmt) {
+
+    case ChatFmt::Zephyr: {
+        if (!system_msg.empty()) {
+            out += "<|system|>\n"; out += system_msg; out += "</s>\n";
+        }
+        for (const auto& msg : history) {
+            if (msg.role == "user") {
+                out += "<|user|>\n"; out += msg.text; out += "</s>\n";
+            } else {
+                out += "<|assistant|>\n"; out += msg.text; out += "</s>\n";
+            }
+        }
+        out += "<|user|>\n"; out += user_msg; out += "</s>\n";
+        out += "<|assistant|>\n";
+        break;
+    }
+
+    case ChatFmt::LLaMA2: {
+        bool first = true;
+        for (size_t i = 0; i < history.size(); i += 2) {
+            const std::string& u = history[i].text;
+            const std::string  a = (i + 1 < history.size()) ? history[i+1].text : "";
+            if (first && !system_msg.empty()) {
+                out += "[INST] <<SYS>>\n"; out += system_msg;
+                out += "\n<</SYS>>\n\n";
+                out += u; out += " [/INST] "; first = false;
+            } else {
+                out += "[INST] "; out += u; out += " [/INST] ";
+            }
+            if (!a.empty()) { out += a; out += " </s><s>"; }
+        }
+        if (first && !system_msg.empty()) {
+            out += "[INST] <<SYS>>\n"; out += system_msg;
+            out += "\n<</SYS>>\n\n";
+            out += user_msg; out += " [/INST]";
+        } else {
+            out += "[INST] "; out += user_msg; out += " [/INST]";
+        }
+        break;
+    }
+
+    case ChatFmt::ChatML: {
+        if (!system_msg.empty()) {
+            out += "<|im_start|>system\n"; out += system_msg;
+            out += "<|im_end|>\n";
+        }
+        for (const auto& msg : history) {
+            out += "<|im_start|>"; out += msg.role; out += "\n";
+            out += msg.text; out += "<|im_end|>\n";
+        }
+        out += "<|im_start|>user\n"; out += user_msg;
+        out += "<|im_end|>\n";
+        out += "<|im_start|>assistant\n";
+        break;
+    }
+
+    default:
+        out = user_msg;
+        break;
+    }
+    return out;
+}
+
 // ── Shared generation core ────────────────────────────────────────────────────
 
 using TokenCallback = std::function<void(int32_t)>;
 
 static void dispatch_generate(const axonforge::Engine& engine,
                                const std::vector<int32_t>& prompt_ids,
-                               int max_new_tokens, float temperature, int top_k,
+                               int max_new_tokens, float temperature,
+                               int top_k, float top_p, float rep_penalty,
+                               int n_threads,
                                TokenCallback on_token) {
     const std::string& arch = engine.model_config().arch;
     if (arch == "gpt2") {
@@ -137,6 +224,9 @@ static void dispatch_generate(const axonforge::Engine& engine,
         cfg.max_new_tokens = max_new_tokens;
         cfg.temperature    = temperature;
         cfg.top_k          = top_k;
+        cfg.top_p          = top_p;
+        cfg.rep_penalty    = rep_penalty;
+        cfg.n_threads      = n_threads;
         cfg.on_token       = std::move(on_token);
         axonforge::llama_generate(engine, prompt_ids, cfg);
     }
@@ -146,7 +236,9 @@ static void dispatch_generate(const axonforge::Engine& engine,
 static std::vector<int32_t>
 generate_and_print(const axonforge::Engine& engine,
                    const std::vector<int32_t>& prompt_ids,
-                   int max_new_tokens, float temperature, int top_k,
+                   int max_new_tokens, float temperature,
+                   int top_k, float top_p, float rep_penalty,
+                   int n_threads,
                    bool show_stats, bool verbose, bool colours) {
     using Clock = std::chrono::steady_clock;
     const auto t_start = Clock::now();
@@ -158,7 +250,9 @@ generate_and_print(const axonforge::Engine& engine,
 
     if (colours) std::printf("%s", COL_REPLY);
 
-    dispatch_generate(engine, prompt_ids, max_new_tokens, temperature, top_k,
+    std::string utf8_buf;
+    dispatch_generate(engine, prompt_ids, max_new_tokens, temperature,
+                      top_k, top_p, rep_penalty, n_threads,
         [&](int32_t tok_id) {
             if (!first_done) {
                 ttft_ms = std::chrono::duration<double, std::milli>(
@@ -166,10 +260,21 @@ generate_and_print(const axonforge::Engine& engine,
                 first_done = true;
             }
             gen_ids.push_back(tok_id);
-            const std::string frag = engine.decode({&tok_id, 1});
-            std::printf("%s", frag.c_str());
-            std::fflush(stdout);
+            utf8_buf += engine.decode({&tok_id, 1});
+            // Flush only complete UTF-8 code points
+            size_t safe = 0;
+            for (size_t j = 0; j < utf8_buf.size(); ) {
+                unsigned char c = static_cast<unsigned char>(utf8_buf[j]);
+                size_t seq = (c < 0x80u) ? 1u : (c < 0xE0u) ? 2u : (c < 0xF0u) ? 3u : 4u;
+                if (j + seq <= utf8_buf.size()) { j += seq; safe = j; } else break;
+            }
+            if (safe > 0) {
+                std::printf("%.*s", (int)safe, utf8_buf.c_str());
+                std::fflush(stdout);
+                utf8_buf.erase(0, safe);
+            }
         });
+    if (!utf8_buf.empty()) { std::printf("%s", utf8_buf.c_str()); }
 
     const double total_ms = std::chrono::duration<double, std::milli>(
                                 Clock::now() - t_start).count();
@@ -212,19 +317,25 @@ generate_and_print(const axonforge::Engine& engine,
 
 static void run_once(const axonforge::Engine& engine,
                      const std::string& prompt_text,
-                     int max_new_tokens, float temperature, int top_k,
+                     int max_new_tokens, float temperature,
+                     int top_k, float top_p, float rep_penalty,
+                     int n_threads,
                      bool show_stats, bool verbose, bool colours) {
     const auto prompt_ids = engine.encode(prompt_text, /*add_bos=*/false);
-    generate_and_print(engine, prompt_ids, max_new_tokens, temperature, top_k,
-                       show_stats, verbose, colours);
+    generate_and_print(engine, prompt_ids, max_new_tokens, temperature,
+                       top_k, top_p, rep_penalty, n_threads, show_stats, verbose, colours);
 }
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
 static void run_interactive(const axonforge::Engine& engine,
                              const std::string& prefix,
-                             int max_new_tokens, float temperature, int top_k,
-                             bool verbose) {
+                             int max_new_tokens, float temperature,
+                             int top_k, float top_p, float rep_penalty,
+                             int n_threads,
+                             bool verbose,
+                             ChatFmt chat_fmt,
+                             const std::string& system_msg) {
     const bool colours = is_tty();
     print_banner(colours);
 
@@ -244,9 +355,10 @@ static void run_interactive(const axonforge::Engine& engine,
     // ── Conversation state ───────────────────────────────────────────────────
     // history_ids accumulates all past token IDs (without BOS; llama_generate
     // prepends BOS automatically). Each turn: prompt = history + user_ids.
-    std::vector<int32_t> history_ids;
-    const int max_context  = mc.max_seq_len > 0 ? std::min(mc.max_seq_len, 4096) : 4096;
-    const int history_cap  = max_context - max_new_tokens - 16;  // leave room for decode
+    const int max_context = mc.max_seq_len > 0 ? std::min(mc.max_seq_len, 4096) : 4096;
+    const int history_cap = max_context - max_new_tokens - 16;
+    std::vector<ChatMsg>  chat_history;   // chat mode: (role, text) pairs
+    std::vector<int32_t>  history_ids;    // raw mode: accumulated token IDs
 
     std::string line;
     for (;;) {
@@ -294,39 +406,48 @@ static void run_interactive(const axonforge::Engine& engine,
         }
         if (line == "/new") {
             history_ids.clear();
+            chat_history.clear();
             if (colours) std::printf("%s", COL_STATS);
             std::printf("[Conversation history cleared. Starting fresh.]\n\n");
             if (colours) std::printf("%s", COL_RESET);
             continue;
         }
 
-        // ── Build prompt with history ─────────────────────────────────────────
+        // ── Build prompt ─────────────────────────────────────────────────────────────────────────────────
         const std::string user_text = prefix.empty() ? line : prefix + line;
-        auto user_ids = engine.encode(user_text, /*add_bos=*/false);
-
-        // Truncate oldest history tokens if context would overflow
-        if ((int)(history_ids.size() + user_ids.size()) > history_cap) {
-            const int excess = (int)(history_ids.size() + user_ids.size()) - history_cap;
-            if (excess < (int)history_ids.size())
-                history_ids.erase(history_ids.begin(), history_ids.begin() + excess);
-            else
-                history_ids.clear();
-            if (verbose) std::fprintf(stderr, "[context window trimmed]\n");
+        std::vector<int32_t> prompt_ids;
+        if (chat_fmt != ChatFmt::Raw) {
+            const std::string full_prompt = format_chat(chat_fmt, system_msg, chat_history, user_text);
+            prompt_ids = engine.encode(full_prompt, /*add_bos=*/false, /*raw=*/true);
+        } else {
+            auto user_ids = engine.encode(user_text, /*add_bos=*/false);
+            if ((int)(history_ids.size() + user_ids.size()) > history_cap) {
+                const int excess = (int)(history_ids.size() + user_ids.size()) - history_cap;
+                if (excess < (int)history_ids.size())
+                    history_ids.erase(history_ids.begin(), history_ids.begin() + excess);
+                else
+                    history_ids.clear();
+                if (verbose) std::fprintf(stderr, "[context window trimmed]\n");
+            }
+            prompt_ids.reserve(history_ids.size() + user_ids.size());
+            prompt_ids.insert(prompt_ids.end(), history_ids.begin(), history_ids.end());
+            prompt_ids.insert(prompt_ids.end(), user_ids.begin(), user_ids.end());
         }
 
-        std::vector<int32_t> prompt_ids;
-        prompt_ids.reserve(history_ids.size() + user_ids.size());
-        prompt_ids.insert(prompt_ids.end(), history_ids.begin(), history_ids.end());
-        prompt_ids.insert(prompt_ids.end(), user_ids.begin(), user_ids.end());
-
-        // ── Generate ─────────────────────────────────────────────────────────
+        // ── Generate ─────────────────────────────────────────────────────────────────────────────────────
         const auto gen_ids = generate_and_print(
-            engine, prompt_ids, max_new_tokens, temperature, top_k,
-            /*show_stats=*/true, verbose, colours);
+            engine, prompt_ids, max_new_tokens, temperature,
+            top_k, top_p, rep_penalty, n_threads, /*show_stats=*/true, verbose, colours);
 
-        // ── Update history: prompt + generated response ───────────────────────
-        history_ids = std::move(prompt_ids);
-        history_ids.insert(history_ids.end(), gen_ids.begin(), gen_ids.end());
+        // ── Update history ───────────────────────────────────────────────────────────────────────────────
+        if (chat_fmt != ChatFmt::Raw) {
+            const std::string asst_text = engine.decode({gen_ids.data(), gen_ids.size()});
+            chat_history.push_back({"user",      user_text});
+            chat_history.push_back({"assistant", asst_text});
+        } else {
+            history_ids = std::move(prompt_ids);
+            history_ids.insert(history_ids.end(), gen_ids.begin(), gen_ids.end());
+        }
 
         std::printf("\n");
     }
@@ -342,10 +463,14 @@ int main(int argc, char* argv[]) {
     std::string backend_id    = "cpu_x86";
     int         max_new_tokens = 256;
     float       temperature    = 0.8f;
+    int         n_threads      = 0;    // 0 = auto (hardware_concurrency)
     int         top_k          = 40;
     float       top_p          = 0.95f;
+    float       rep_penalty    = 1.1f;
     bool        interactive    = false;
     bool        verbose        = false;
+    bool        chat_mode      = false;
+    std::string system_msg     = "You are a helpful assistant.";
 
     if (argc == 1) { print_usage(argv[0]); return 0; }
 
@@ -366,11 +491,16 @@ int main(int argc, char* argv[]) {
             { interactive = true; continue; }
         if ((std::strcmp(arg, "-V") == 0 || std::strcmp(arg, "--verbose") == 0))
             { verbose = true; continue; }
+        if (std::strcmp(arg, "--chat") == 0) { chat_mode = true; continue; }
+        if (std::strcmp(arg, "--rep-penalty") == 0 && i + 1 < argc) { rep_penalty = std::atof(argv[++i]); continue; }
+        if (std::strcmp(arg, "--system") == 0 && i + 1 < argc)
+            { system_msg = argv[++i]; continue; }
         if (std::strcmp(arg, "-m") == 0 && i + 1 < argc) { model_path = argv[++i]; continue; }
         if (std::strcmp(arg, "-p") == 0 && i + 1 < argc) { prompt     = argv[++i]; continue; }
         if (std::strcmp(arg, "--prefix") == 0 && i + 1 < argc) { prefix = argv[++i]; continue; }
         if (std::strcmp(arg, "-b") == 0 && i + 1 < argc) { backend_id = argv[++i]; continue; }
         if (std::strcmp(arg, "-n") == 0 && i + 1 < argc) { max_new_tokens = std::atoi(argv[++i]); continue; }
+        if (std::strcmp(arg, "-j") == 0 && i + 1 < argc) { n_threads      = std::atoi(argv[++i]); continue; }
         if (std::strcmp(arg, "-t") == 0 && i + 1 < argc) { temperature    = std::atof(argv[++i]); continue; }
         if (std::strcmp(arg, "--top-k") == 0 && i + 1 < argc) { top_k   = std::atoi(argv[++i]); continue; }
         if (std::strcmp(arg, "--top-p") == 0 && i + 1 < argc) { top_p   = std::atof(argv[++i]); continue; }
@@ -401,12 +531,19 @@ int main(int argc, char* argv[]) {
         auto engine = axonforge::Engine::from_gguf(model_path, eng_cfg);
 
         if (interactive) {
-            run_interactive(engine, prefix, max_new_tokens, temperature, top_k, verbose);
+            const ChatFmt fmt = chat_mode
+                ? detect_chat_fmt(engine.chat_template())
+                : ChatFmt::Raw;
+            if (chat_mode && fmt == ChatFmt::Raw)
+                std::fprintf(stderr,
+                    "[AxonForge] Warning: --chat used but no chat template found in model; raw mode.\n");
+            run_interactive(engine, prefix, max_new_tokens, temperature,
+                            top_k, top_p, rep_penalty, n_threads, verbose, fmt, system_msg);
         } else {
             std::fprintf(stderr, "[AxonForge] Prompt: %s\n", prompt.c_str());
             const bool colours = is_tty();
-            run_once(engine, prompt, max_new_tokens, temperature, top_k,
-                     /*show_stats=*/true, verbose, colours);
+            run_once(engine, prompt, max_new_tokens, temperature,
+                     top_k, top_p, rep_penalty, n_threads, /*show_stats=*/true, verbose, colours);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[AxonForge] Error: %s\n", e.what());

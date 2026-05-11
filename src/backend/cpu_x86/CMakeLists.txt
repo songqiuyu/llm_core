@@ -11,6 +11,9 @@ if(AXONFORGE_ENABLE_AVX2)
         kernels/gemv_f16_avx2.cpp
         kernels/gemv_q4k_avx2.cpp
         kernels/gemv_q6k_avx2.cpp
+        kernels/quant_q8_avx2.cpp
+        kernels/gemv_q4k_q8_avx2.cpp
+        kernels/gemv_q6k_q8_avx2.cpp
         kernels/elementwise_avx2.cpp
         kernels/norm_avx2.cpp
     )
@@ -21,6 +24,20 @@ if(AXONFORGE_ENABLE_AVX2)
                 ${CMAKE_CURRENT_SOURCE_DIR}
     )
     target_sources(axonforge PRIVATE $<TARGET_OBJECTS:axonforge_kernels_avx2>)
+endif()
+
+# ---- AVX-VNNI kernel object library (VEX-encoded, Alder Lake+) ----
+if(AXONFORGE_ENABLE_AVX2)
+    add_library(axonforge_kernels_avxvnni OBJECT
+        kernels/gemv_q4k_q8_avxvnni.cpp
+    )
+    target_compile_options(axonforge_kernels_avxvnni PRIVATE -mavx2 -mfma -mf16c -mavxvnni -O3)
+    target_include_directories(axonforge_kernels_avxvnni
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+                ${CMAKE_BINARY_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_sources(axonforge PRIVATE $<TARGET_OBJECTS:axonforge_kernels_avxvnni>)
 endif()
 
 # ---- AVX-512 VNNI kernel object library ----

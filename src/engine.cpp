@@ -24,6 +24,7 @@ struct Engine::Impl {
     std::unique_ptr<GgufReader>            gguf;       // keeps mmap alive
     std::unordered_map<std::string,Tensor> weights;    // name → zero-copy mmap view
     std::vector<std::string>               vocabulary;   // token_id → token string
+    std::string                            chat_template; // tokenizer.chat_template (Jinja2)
     int32_t                                bos_token_id{1};
     int32_t                                eos_token_id{2};
     // TODO(Phase0): BpeTokenizer tokenizer
@@ -44,6 +45,7 @@ Engine::~Engine() = default;
 
 const ModelConfig&  Engine::model_config()   const noexcept { return impl_->model_cfg; }
 const EngineConfig& Engine::engine_config()  const noexcept { return impl_->engine_cfg; }
+const std::string&  Engine::chat_template()  const noexcept { return impl_->chat_template; }
 int32_t Engine::bos_id()     const noexcept { return impl_->bos_token_id; }
 int32_t Engine::eos_id()     const noexcept { return impl_->eos_token_id; }
 int32_t Engine::vocab_size() const noexcept { return impl_->model_cfg.vocab_size; }
@@ -125,6 +127,9 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
         }
     }
 
+    // ---- Extract chat template ----
+    impl->chat_template = impl->gguf->get_str("tokenizer.chat_template", "");
+
     if (impl->engine_cfg.verbose) {
         const auto& mc = impl->model_cfg;
         std::fprintf(stderr,
@@ -145,11 +150,11 @@ static bool is_llama_arch(const std::string& arch) {
         || arch == "mistral" || arch == "tinyllama";
 }
 
-std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/) const {
+std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/, bool raw) const {
     if (impl_->model_cfg.arch == "gpt2")
         return gpt2_encode_simple(*this, text);
     if (is_llama_arch(impl_->model_cfg.arch))
-        return llama_encode_simple(*this, text);
+        return llama_encode_simple(*this, text, raw);
     throw std::runtime_error(
         "Engine::encode: no tokenizer for arch '" + impl_->model_cfg.arch + "'");
 }

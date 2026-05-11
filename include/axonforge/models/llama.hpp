@@ -19,12 +19,16 @@ struct LlamaConfig {
     float temperature     = 1.0f;
     int   top_k           = 40;
     bool  verbose         = false;
-    int   n_threads       = 0;    // 0 = auto (min(8, nproc/2))
+    int   n_threads       = 0;    // 0 = auto (min(14, nproc)); use -j to override
 
     // Hard cap on the KV cache size (context window).
     // LLaMA-3 declares 128K context; allocating that naively costs ~32 GB.
     // Keep at 4096 unless you explicitly need longer sequences.
     int   max_context_len = 4096;
+
+    float top_p             = 1.0f;   // nucleus cutoff (1.0 = off)
+    float rep_penalty       = 1.0f;   // repetition penalty (1.0 = off)
+    int   rep_penalty_last_n= 64;     // window size for rep penalty
 
     // Streaming callback: called immediately after each new token is sampled.
     // Receives raw token id; call llama_decode_tokens(engine, {id}) for text.
@@ -58,8 +62,11 @@ std::string llama_decode_tokens(
 // Simple greedy tokenizer — longest-match against vocabulary.
 // Sufficient for throughput benchmarking and simple prompts.
 // ============================================================
+// raw=true: skip the leading '▁' normalisation and use byte-fallback for
+// characters not found in the vocabulary (needed for chat-template prompts).
 std::vector<int32_t> llama_encode_simple(
     const Engine&    engine,
-    std::string_view text);
+    std::string_view text,
+    bool             raw = false);
 
 } // namespace axonforge

@@ -77,6 +77,62 @@ static float dot_f16_avx2(const uint16_t* __restrict__ W,
     return sum;
 }
 
+// ── 4-row simultaneous F16 dot product ───────────────────────────────────────
+// Rows o, o+1, o+2, o+3 share the same x loads; 8 independent accumulators.
+static inline void dot_f16_4rows_(float* y, int o,
+                                   const uint16_t* W, int in,
+                                   const float* x) noexcept {
+    __m256 a0a = _mm256_setzero_ps(), a0b = _mm256_setzero_ps();
+    __m256 a1a = _mm256_setzero_ps(), a1b = _mm256_setzero_ps();
+    __m256 a2a = _mm256_setzero_ps(), a2b = _mm256_setzero_ps();
+    __m256 a3a = _mm256_setzero_ps(), a3b = _mm256_setzero_ps();
+
+    const uint16_t* r0 = W + (size_t)(o + 0) * in;
+    const uint16_t* r1 = W + (size_t)(o + 1) * in;
+    const uint16_t* r2 = W + (size_t)(o + 2) * in;
+    const uint16_t* r3 = W + (size_t)(o + 3) * in;
+
+    int k = 0;
+    for (; k + 16 <= in; k += 16) {
+        // Load x once (16 floats = 2 AVX2 regs) — shared across 4 rows
+        const __m256 xv0 = _mm256_loadu_ps(x + k);
+        const __m256 xv1 = _mm256_loadu_ps(x + k + 8);
+
+        a0a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r0+k  ))), xv0, a0a);
+        a0b = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r0+k+8))), xv1, a0b);
+        a1a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r1+k  ))), xv0, a1a);
+        a1b = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r1+k+8))), xv1, a1b);
+        a2a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r2+k  ))), xv0, a2a);
+        a2b = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r2+k+8))), xv1, a2b);
+        a3a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r3+k  ))), xv0, a3a);
+        a3b = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r3+k+8))), xv1, a3b);
+    }
+    // Handle remaining 8-wide tail
+    for (; k + 8 <= in; k += 8) {
+        const __m256 xv0 = _mm256_loadu_ps(x + k);
+        a0a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r0+k))), xv0, a0a);
+        a1a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r1+k))), xv0, a1a);
+        a2a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r2+k))), xv0, a2a);
+        a3a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(r3+k))), xv0, a3a);
+    }
+    float s0 = hsum256(_mm256_add_ps(a0a, a0b));
+    float s1 = hsum256(_mm256_add_ps(a1a, a1b));
+    float s2 = hsum256(_mm256_add_ps(a2a, a2b));
+    float s3 = hsum256(_mm256_add_ps(a3a, a3b));
+    // scalar tail (rare, only when in % 8 != 0)
+    for (; k < in; k++) {
+        float xk = x[k];
+        s0 += scalar_f16(r0[k]) * xk;
+        s1 += scalar_f16(r1[k]) * xk;
+        s2 += scalar_f16(r2[k]) * xk;
+        s3 += scalar_f16(r3[k]) * xk;
+    }
+    y[o + 0] = s0;
+    y[o + 1] = s1;
+    y[o + 2] = s2;
+    y[o + 3] = s3;
+}
+
 // ── Full GEMV for a range of output rows [o_start, o_end) ────────────────────
 // Called from ThreadPool workers — each thread gets a disjoint row slice.
 void gemv_f16_avx2_range(float* __restrict__       y,
@@ -84,7 +140,13 @@ void gemv_f16_avx2_range(float* __restrict__       y,
                           const float*    __restrict__ x,
                           const float*    __restrict__ b,
                           int o_start, int o_end, int in) noexcept {
-    for (int o = o_start; o < o_end; o++) {
+    int o = o_start;
+    // 4-row tile (b==nullptr is normal for llama; GPT-2 has bias only on attn/ffn)
+    if (!b) {
+        for (; o + 4 <= o_end; o += 4)
+            dot_f16_4rows_(y, o, W, in, x);
+    }
+    for (; o < o_end; o++) {
         float acc = dot_f16_avx2(W + (size_t)o * in, x, in);
         y[o] = acc + (b ? b[o] : 0.f);
     }

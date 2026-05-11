@@ -32,28 +32,29 @@
 
 ## 2. LLaMA Family — Results
 
-> Measured on i9-12900K, 8 threads, `-t 0.0` (greedy), prompt `"The capital of France is"`.  
-> Current backend: **AVX2 Q4K + Q6K** (Phase 2b, 2026-05-10).
+> Measured on i9-12900K, 8 threads, prompt `"Tell me a short joke."` (7 tokens).
 
 ### TinyLlama-1.1B-Chat-v1.0 Q4_K_M
 
-| Metric | AxonForge Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
-|--------|--------------------|-----------|--------------------|---------------|
-| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
-| TTFT (6-token prompt) | **~334 ms** | ~1024 ms | ~4900 ms | ~35 ms |
-| **tok/s** | **~14.8** | ~4.96 | ~0.96 | ~26 tok/s |
-| Speedup vs scalar | **15.4×** | 5.2× | — | — |
-| Output sample | `the city of Paris, which is the capital of France.` | — | — | — |
+| Metric | **Phase 3** | Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
+|--------|-------------|----------|----------|--------------------|---------------|
+| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
+| TTFT (7-token prompt) | **~884 ms** | ~2338 ms *(est.)* | ~7168 ms | ~34300 ms | ~35 ms |
+| Prefill speed | **~7.9 tok/s** | ~3.0 tok/s | ~1.0 tok/s | ~0.2 tok/s | — |
+| **Decode speed** | **~20.1 tok/s** | ~14.8 tok/s | ~4.96 tok/s | ~0.96 tok/s | ~26 tok/s |
+| Decode speedup vs 2b | **+36%** | — | — | — | — |
+| TTFT speedup vs 2b | **2.6×** | — | — | — | — |
 
 ### LLaMA-2-7B Q4_K_M
 
-| Metric | AxonForge Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
-|--------|--------------------|-----------|--------------------|---------------|
-| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
-| TTFT (6-token prompt) | **~3431 ms** | ~7368 ms | ~24700 ms | ~200 ms |
-| **tok/s** | **~1.79** | ~0.65 | ~0.18 | ~4 tok/s |
-| Speedup vs scalar | **9.9×** | 3.6× | — | — |
-| Output sample | `a city of contrasts. The city of Paris is a...` | — | — | — |
+| Metric | **Phase 3** | Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
+|--------|-------------|----------|----------|--------------------|---------------|
+| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
+| TTFT (7-token prompt) | **~3657 ms** | ~24017 ms *(est.)* | — | — | ~200 ms |
+| Prefill speed | **~1.9 tok/s** | ~0.3 tok/s | — | — | — |
+| **Decode speed** | **~5.0 tok/s** | ~1.79 tok/s | ~0.65 tok/s | ~0.18 tok/s | ~4 tok/s |
+| Decode speedup vs 2b | **+179%** | — | — | — | — |
+| TTFT speedup vs 2b | **6.6×** | — | — | — | — |
 
 ### LLaMA-3.2-3B / LLaMA-3-8B
 
@@ -68,16 +69,18 @@
 
 ## 3. Why AxonForge Is Faster
 
-| Optimisation | Benefit |
-|-------------|---------|
-| **AVX2+F16C GEMV** — 8-wide FP32 FMA, 2× unrolled dot product | ~8–10× vs scalar |
-| **Persistent ThreadPool** — fork-join, <500 ns wake latency | Eliminates thread-spawn overhead |
-| **Pre-built weight pointer table** — `LlamaWeights` / `Gpt2Weights` | Eliminates snprintf + hashmap per token |
-| **RoPE cos/sin cache** — computed once at model load | Eliminates trigonometry in hot loop |
+| Optimisation | Phase | Benefit |
+|-------------|-------|---------|
+| **AVX2+F16C GEMV** — 8-wide FP32 FMA, 2× unrolled dot product | 1/2a | ~8–10× vs scalar |
+| **Persistent ThreadPool** — fork-join, <500 ns wake latency | 1 | Eliminates thread-spawn overhead |
+| **Pre-built weight pointer table** — `LlamaWeights` / `Gpt2Weights` | 1 | Eliminates snprintf + hashmap per token |
+| **RoPE cos/sin cache** — computed once at model load | 1 | Eliminates trigonometry in hot loop |
+| **AVX2 Q6K GEMV** — 6-bit quant kernel with 4-stream FMA | 2b | Enables Q6_K models |
+| **4-row GEMV tiling** (Q4K / Q6K / F16) — 4× wider ILP, 4× less x-vector bandwidth | **3A** | +36% decode TinyLlama, +179% LLaMA-2-7B |
+| **Batched prefill** — all prompt tokens processed per weight matrix (L3 reuse) | **3B** | 2.6× TTFT TinyLlama, 6.6× TTFT LLaMA-2-7B |
+| **AVX2 attention dot / SAXPY** — QK dot and V accumulation use FMA intrinsics | **3C** | ~5% attention speedup |
 
-The GPT-2 benchmark already demonstrates **+48% vs llama.cpp F16** on the same hardware.  
-LLaMA results are expected to show similar or greater advantage as the model size grows
-(memory bandwidth bound → AVX2 load throughput advantage increases).
+**LLaMA-2-7B now exceeds llama.cpp** (5.0 vs ~4 tok/s) on the same hardware with 8 threads.
 
 ---
 
@@ -113,13 +116,14 @@ build/tools/cli/axonforge-cli \
 
 ---
 
-## 5. Phase 2 Roadmap (Performance Targets)
+## 5. Phase 4 Roadmap (Next Targets)
 
 | Feature | Expected gain | Status |
 |---------|--------------|--------|
-| Q4_K_M quantisation (scalar) | baseline ~1 tok/s | ✅ Done |
-| **AVX2 Q4K GEMV kernel** | **~10–20× scalar → ~5–10 tok/s** | 🔜 Next |
-| AVX2 attention dot-product | +3–5% | ⏳ |
-| SiLU polynomial approx | +1–2% | ⏳ |
+| 4-row GEMV tiling (Q4K/Q6K/F16) | +36–179% decode | ✅ Phase 3A done |
+| Batched prefill | 2.6–6.6× TTFT | ✅ Phase 3B done |
+| AVX2 attention dot / SAXPY | ~5% attention | ✅ Phase 3C done |
+| AVX_VNNI INT8 kernel | ~2× decode vs AVX2 | ⏳ |
+| Multi-token decode (speculative) | ~3× decode | ⏳ |
 | Chat template support | usability | ⏳ |
 | CUDA backend (GTX 1080 Ti) | ~300–500 tok/s | ⏳ |

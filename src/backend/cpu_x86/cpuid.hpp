@@ -6,6 +6,7 @@ namespace axonforge::cpu_x86 {
 struct CpuFeatures {
     bool sse42       = false;
     bool avx2        = false;
+    bool avxvnni     = false;   // VEX AVX-VNNI (Alder Lake+, CPUID 7.1.EAX[4])
     bool avx512f     = false;
     bool avx512vnni  = false;
     bool avx512bf16  = false;

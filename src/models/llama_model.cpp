@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <immintrin.h>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,8 @@
 #include "../core/thread_pool.hpp"
 // CPU feature detection
 #include "../backend/cpu_x86/cpuid.hpp"
+// Q8_0 block struct (shared with kernel files)
+#include "../backend/cpu_x86/kernels/q8_block.hpp"
 
 // ─── AVX2+F16C GEMV forward declaration ──────────────────────────────────────
 namespace axonforge::cpu_x86 {
@@ -50,6 +53,29 @@ namespace axonforge::cpu_x86 {
     void  gemv_q6k_avx2_range(float* y, const uint8_t* W, const float* x,
                                int o_start, int o_end, int in_dim,
                                size_t row_bytes) noexcept;
+    // ── Q8_0 kernels (Phase 4) ────────────────────────────────────────────────
+    void quantize_q8_avx2(block_q8_0* y, const float* x, int k) noexcept;
+    void gemv_q4k_q8_avx2_range(float* y, const uint8_t* W,
+                                 const block_q8_0* xq8,
+                                 int o_start, int o_end, int in_dim,
+                                 size_t row_bytes) noexcept;
+    void gemm_q4k_q8_avx2_range(float* Y, const uint8_t* W,
+                                 const block_q8_0* XQ8,
+                                 int M, int T, int K, size_t row_bytes,
+                                 int o_start, int o_end) noexcept;
+    void gemv_q6k_q8_avx2_range(float* y, const uint8_t* W,
+                                 const block_q8_0* xq8,
+                                 int o_start, int o_end, int in_dim,
+                                 size_t row_bytes) noexcept;
+    // ── AVX-VNNI kernels (gemv_q4k_q8_avxvnni.cpp, -mavxvnni) ───────────────
+    void gemv_q4k_q8_avxvnni_range(float* y, const uint8_t* W,
+                                    const block_q8_0* xq8,
+                                    int o_start, int o_end, int in_dim,
+                                    size_t row_bytes) noexcept;
+    void gemm_q4k_q8_avxvnni_range(float* Y, const uint8_t* W,
+                                    const block_q8_0* XQ8,
+                                    int M, int T, int K, size_t row_bytes,
+                                    int o_start, int o_end) noexcept;
 }
 
 namespace axonforge {
@@ -124,6 +150,83 @@ static void rms_norm(float* __restrict__ x,
 
 static inline float silu(float x) noexcept {
     return x / (1.f + std::exp(-x));
+}
+
+// ── AVX2 exp(x) — Cephes single-precision polynomial, max error ~2^-23 ───────
+static inline __m256 exp_avx2_(const __m256 x) noexcept {
+    const __m256 clamp_hi = _mm256_set1_ps( 88.3762626648f);
+    const __m256 clamp_lo = _mm256_set1_ps(-88.3762626648f);
+    const __m256 inv_log2e = _mm256_set1_ps(1.44269504089f);
+    const __m256 ln2_hi   = _mm256_set1_ps(0.693359375f);
+    const __m256 ln2_lo   = _mm256_set1_ps(-2.12194440e-4f);
+    const __m256 half     = _mm256_set1_ps(0.5f);
+    const __m256 one      = _mm256_set1_ps(1.f);
+
+    __m256 xx = _mm256_max_ps(clamp_lo, _mm256_min_ps(x, clamp_hi));
+    __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(xx, inv_log2e, half));
+    xx = _mm256_fnmadd_ps(fx, ln2_hi, xx);
+    xx = _mm256_fnmadd_ps(fx, ln2_lo, xx);
+
+    __m256 z = _mm256_mul_ps(xx, xx);
+    __m256 p = _mm256_set1_ps(1.9875691500E-4f);
+    p = _mm256_fmadd_ps(p, xx, _mm256_set1_ps(1.3981999507E-3f));
+    p = _mm256_fmadd_ps(p, xx, _mm256_set1_ps(8.3334519073E-3f));
+    p = _mm256_fmadd_ps(p, xx, _mm256_set1_ps(4.1665795894E-2f));
+    p = _mm256_fmadd_ps(p, xx, _mm256_set1_ps(1.6666665459E-1f));
+    p = _mm256_fmadd_ps(p, xx, _mm256_set1_ps(5.0000001201E-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_add_ps(xx, one));
+
+    __m256i n = _mm256_slli_epi32(
+        _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(n));
+}
+
+// ── AVX2 SwiGLU:  gate[i] = silu(gate[i]) * up[i] ───────────────────────────
+// sigmoid(g) computed as: exp(-|g|)/(1+exp(-|g|)) or 1/(1+exp(-|g|))
+static void swiglu_avx2(float* __restrict__ gate,
+                         const float* __restrict__ up, int n) noexcept {
+    const __m256 one     = _mm256_set1_ps(1.f);
+    const __m256 neg_zero = _mm256_set1_ps(-0.f);
+    const __m256 zero    = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 g       = _mm256_loadu_ps(gate + i);
+        const __m256 u       = _mm256_loadu_ps(up   + i);
+        const __m256 neg_abs = _mm256_or_ps(neg_zero, g);          // -|g|
+        const __m256 e       = exp_avx2_(neg_abs);                  // exp(-|g|)
+        const __m256 denom   = _mm256_add_ps(one, e);
+        const __m256 sig_pos = _mm256_div_ps(one, denom);          // g >= 0
+        const __m256 sig_neg = _mm256_div_ps(e,   denom);          // g <  0
+        const __m256 mask    = _mm256_cmp_ps(g, zero, _CMP_LT_OQ);
+        const __m256 sig     = _mm256_blendv_ps(sig_pos, sig_neg, mask);
+        _mm256_storeu_ps(gate + i, _mm256_mul_ps(_mm256_mul_ps(g, sig), u));
+    }
+    for (; i < n; i++) gate[i] = silu(gate[i]) * up[i];
+}
+
+// ── AVX2 RMSNorm ─────────────────────────────────────────────────────────────
+static void rms_norm_avx2(float* __restrict__ x,
+                            const float* __restrict__ w,
+                            int n, float eps) noexcept {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    float ss = 0.f;
+    float tmp[8]; _mm256_storeu_ps(tmp, acc);
+    for (int k = 0; k < 8; k++) ss += tmp[k];
+    for (; i < n; i++) ss += x[i] * x[i];
+    ss = 1.f / std::sqrt(ss / n + eps);
+    const __m256 scale = _mm256_set1_ps(ss);
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xi = _mm256_loadu_ps(x + i);
+        const __m256 wi = _mm256_loadu_ps(w + i);
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(wi, _mm256_mul_ps(xi, scale)));
+    }
+    for (; i < n; i++) x[i] = w[i] * x[i] * ss;
 }
 
 // ─── Softmax in-place ─────────────────────────────────────────────────────────
@@ -205,6 +308,33 @@ static const Q6kDotRowFn kQ6kDotRow =
     cpu_x86::cpu_features().avx2
         ? cpu_x86::q6k_dot_row_avx2
         : q6k_dot_row;
+
+// ─── Q4K / Q6K range-function dispatch (includes 4-row tiling when AVX2) ────
+using Q4kRangeFn = void(*)(float*, const uint8_t*, const float*,
+                            int, int, int, size_t) noexcept;
+static void q4k_scalar_range(float* y, const uint8_t* W, const float* x,
+                               int o0, int o1, int in_dim,
+                               size_t row_bytes) noexcept {
+    for (int o = o0; o < o1; o++)
+        y[o] = q4k_dot_row(W + (size_t)o * row_bytes, x, in_dim);
+}
+static const Q4kRangeFn kQ4kRange =
+    cpu_x86::cpu_features().avx2
+        ? cpu_x86::gemv_q4k_avx2_range
+        : q4k_scalar_range;
+
+using Q6kRangeFn = void(*)(float*, const uint8_t*, const float*,
+                            int, int, int, size_t) noexcept;
+static void q6k_scalar_range(float* y, const uint8_t* W, const float* x,
+                               int o0, int o1, int in_dim,
+                               size_t row_bytes) noexcept {
+    for (int o = o0; o < o1; o++)
+        y[o] = q6k_dot_row(W + (size_t)o * row_bytes, x, in_dim);
+}
+static const Q6kRangeFn kQ6kRange =
+    cpu_x86::cpu_features().avx2
+        ? cpu_x86::gemv_q6k_avx2_range
+        : q6k_scalar_range;
 
 // ─── Q6_K on-the-fly dequantisation ──────────────────────────────────────────
 // Block layout (210 bytes, QK_K=256 elements):
@@ -331,30 +461,140 @@ static void gemv_wt(float* y, const WT& W, const float* x, int out, int in,
         const size_t row_bytes = (in / QK_K) * Q4K_BYTES;
         if (pool && out >= 32) {
             pool->parallel_for(out, [&](int s, int e) {
-                for (int o = s; o < e; o++)
-                    y[o] = kQ4kDotRow(Wq + (size_t)o * row_bytes, x, in);
+                kQ4kRange(y, Wq, x, s, e, in, row_bytes);
             });
         } else {
-            for (int o = 0; o < out; o++)
-                y[o] = kQ4kDotRow(Wq + (size_t)o * row_bytes, x, in);
+            kQ4kRange(y, Wq, x, 0, out, in, row_bytes);
         }
     } else if (W.dtype == DType::Q6_K) {
         const uint8_t* Wq = static_cast<const uint8_t*>(W.data);
         const size_t row_bytes = (in / QK_K) * Q6K_BYTES;
         if (pool && out >= 32) {
             pool->parallel_for(out, [&](int s, int e) {
-                for (int o = s; o < e; o++)
-                    y[o] = kQ6kDotRow(Wq + (size_t)o * row_bytes, x, in);
+                kQ6kRange(y, Wq, x, s, e, in, row_bytes);
             });
         } else {
-            for (int o = 0; o < out; o++)
-                y[o] = kQ6kDotRow(Wq + (size_t)o * row_bytes, x, in);
+            kQ6kRange(y, Wq, x, 0, out, in, row_bytes);
         }
     } else {
         // Fallback: treat as F16 (BF16 etc.)
         const uint16_t* Wf = static_cast<const uint16_t*>(W.data);
         kLlamaGemvRange(y, Wf, x, nullptr, 0, out, in);
     }
+}
+
+// ─── Phase 4: Q8_0 quantisation dispatch ─────────────────────────────────────
+
+static void kQ8Quant_scalar(block_q8_0* y, const float* x, int k) noexcept {
+    for (int i = 0, nb = k / 32; i < nb; i++) {
+        float amax = 0.f;
+        for (int j = 0; j < 32; j++) {
+            float v = x[i*32+j];
+            if (v < 0) v = -v;
+            if (v > amax) amax = v;
+        }
+        const float d  = amax / 127.f;
+        const float id = (amax > 0.f) ? 127.f / amax : 0.f;
+        y[i].d = d;
+        for (int j = 0; j < 32; j++) {
+            int v = (int)(x[i*32+j] * id + 0.5f);
+            y[i].qs[j] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);
+        }
+    }
+}
+
+using QuantQ8Fn = void(*)(block_q8_0*, const float*, int) noexcept;
+static const QuantQ8Fn kQ8Quant = cpu_x86::cpu_features().avx2
+    ? cpu_x86::quantize_q8_avx2
+    : kQ8Quant_scalar;
+
+// ─── GEMV with Q8_0-quantised input (single token, Phase 4) ─────────────────
+// Uses maddubs INT8 path for Q4_K/Q6_K; falls back to FP32 gemv_wt for F16.
+static void gemv_wt_q8(float* y, const WT& W,
+                        const block_q8_0* xq8, const float* xf32,
+                        int out, int in, ThreadPool* pool) noexcept {
+    if (cpu_x86::cpu_features().avx2) {
+        if (W.dtype == DType::Q4_K_M) {
+            const uint8_t* Wq        = static_cast<const uint8_t*>(W.data);
+            const size_t   row_bytes = (size_t)(in / QK_K) * Q4K_BYTES;
+            const bool     vnni      = cpu_x86::cpu_features().avxvnni;
+            if (pool && out >= 32) {
+                pool->parallel_for(out, [&](int s, int e) {
+                    if (vnni)
+                        cpu_x86::gemv_q4k_q8_avxvnni_range(y, Wq, xq8, s, e, in, row_bytes);
+                    else
+                        cpu_x86::gemv_q4k_q8_avx2_range(y, Wq, xq8, s, e, in, row_bytes);
+                });
+            } else {
+                if (vnni)
+                    cpu_x86::gemv_q4k_q8_avxvnni_range(y, Wq, xq8, 0, out, in, row_bytes);
+                else
+                    cpu_x86::gemv_q4k_q8_avx2_range(y, Wq, xq8, 0, out, in, row_bytes);
+            }
+            return;
+        }
+        if (W.dtype == DType::Q6_K) {
+            const uint8_t* Wq       = static_cast<const uint8_t*>(W.data);
+            const size_t   row_bytes = (size_t)(in / QK_K) * Q6K_BYTES;
+            if (pool && out >= 32) {
+                pool->parallel_for(out, [&](int s, int e) {
+                    cpu_x86::gemv_q6k_q8_avx2_range(y, Wq, xq8, s, e, in, row_bytes);
+                });
+            } else {
+                cpu_x86::gemv_q6k_q8_avx2_range(y, Wq, xq8, 0, out, in, row_bytes);
+            }
+            return;
+        }
+    }
+    gemv_wt(y, W, xf32, out, in, pool);
+}
+
+// ─── GEMM with Q8_0-quantised input (T tokens, Phase 4) ─────────────────────
+// Y[T×M]:  Y[t*M + m] = W[m,:] · XQ8[t,:]
+// XQ8 layout: row t starts at XQ8 + t*(in/32)
+// XF32 fallback: row t starts at XF32 + t*in  (for F16 weights)
+static void gemm_wt_q8(float* Y, const WT& W,
+                        const block_q8_0* XQ8, const float* XF32,
+                        int M, int T, int in, ThreadPool* pool) noexcept {
+    if (cpu_x86::cpu_features().avx2) {
+        if (W.dtype == DType::Q4_K_M) {
+            const uint8_t* Wq        = static_cast<const uint8_t*>(W.data);
+            const size_t   row_bytes = (size_t)(in / QK_K) * Q4K_BYTES;
+            const bool     vnni      = cpu_x86::cpu_features().avxvnni;
+            if (pool && M >= 32) {
+                pool->parallel_for(M, [&](int s, int e) {
+                    if (vnni)
+                        cpu_x86::gemm_q4k_q8_avxvnni_range(Y, Wq, XQ8, M, T, in, row_bytes, s, e);
+                    else
+                        cpu_x86::gemm_q4k_q8_avx2_range(Y, Wq, XQ8, M, T, in, row_bytes, s, e);
+                });
+            } else {
+                if (vnni)
+                    cpu_x86::gemm_q4k_q8_avxvnni_range(Y, Wq, XQ8, M, T, in, row_bytes, 0, M);
+                else
+                    cpu_x86::gemm_q4k_q8_avx2_range(Y, Wq, XQ8, M, T, in, row_bytes, 0, M);
+            }
+            return;
+        }
+        if (W.dtype == DType::Q6_K) {
+            const uint8_t* Wq       = static_cast<const uint8_t*>(W.data);
+            const size_t   row_bytes = (size_t)(in / QK_K) * Q6K_BYTES;
+            if (pool && M >= 32) {
+                pool->parallel_for(M, [&](int s, int e) {
+                    for (int t = 0; t < T; t++)
+                        cpu_x86::gemv_q6k_q8_avx2_range(
+                            Y+(size_t)t*M, Wq, XQ8+(size_t)t*(in/32), s, e, in, row_bytes);
+                });
+            } else {
+                for (int t = 0; t < T; t++)
+                    cpu_x86::gemv_q6k_q8_avx2_range(
+                        Y+(size_t)t*M, Wq, XQ8+(size_t)t*(in/32), 0, M, in, row_bytes);
+            }
+            return;
+        }
+    }
+    for (int t = 0; t < T; t++)
+        gemv_wt(Y + (size_t)t*M, W, XF32 + (size_t)t*in, M, in, pool);
 }
 
 // Embedding lookup: dequantise one row to f32
@@ -500,6 +740,9 @@ struct LlamaState {
     std::vector<float> gate, up;   // FFN gate and up projections [ffn_dim]
     std::vector<float> ffn;        // FFN down projection output [n_embd]
     std::vector<float> logits;
+    // Q8_0 scratch: holds max(n_embd, ffn_dim)/32 blocks for pre-quantised GEMV input
+    std::vector<uint8_t> xq8_scratch;
+    block_q8_0* xq8() noexcept { return reinterpret_cast<block_q8_0*>(xq8_scratch.data()); }
 
     // Pre-built weight pointers
     LlamaWeights weights;
@@ -527,9 +770,10 @@ struct LlamaState {
         attn_out.resize(ne);
         gate.resize(fd); up.resize(fd); ffn.resize(ne);
         logits.resize(nv);
+        xq8_scratch.resize(sizeof(block_q8_0) * (std::max(ne, fd) / 32));
         rope_cache.build(head_dim, rope_theta, nc);
         if (n_threads > 1)
-            pool = std::make_unique<ThreadPool>(n_threads);
+            pool = std::make_unique<ThreadPool>(n_threads - 1); // +1 calling thread = n_threads total
     }
 
     float* k_buf(int layer, int pos) {
@@ -539,6 +783,43 @@ struct LlamaState {
         return kv_v.data() + ((size_t)layer * n_ctx + pos) * kv_embd;
     }
 };
+
+// ─── AVX2 helper: dot product of two F32 vectors (Phase C) ─────────────────
+static inline float avx2_dot_f32(const float* __restrict__ a,
+                                  const float* __restrict__ b,
+                                  int n) noexcept {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i  ), _mm256_loadu_ps(b+i  ), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i+8), _mm256_loadu_ps(b+i+8), acc1);
+    }
+    for (; i + 8 <= n; i += 8)
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), acc0);
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+// ─── AVX2 helper: SAXPY  out[i] += alpha * v[i] ──────────────────────────────
+static inline void avx2_saxpy(float* __restrict__ out,
+                               float alpha,
+                               const float* __restrict__ v,
+                               int n) noexcept {
+    const __m256 va = _mm256_set1_ps(alpha);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(out+i, _mm256_fmadd_ps(va, _mm256_loadu_ps(v+i),
+                                                     _mm256_loadu_ps(out+i)));
+    for (; i < n; i++) out[i] += alpha * v[i];
+}
 
 // ─── Single-token forward pass ────────────────────────────────────────────────
 
@@ -562,12 +843,13 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
 
         // ---- RMSNorm (attention) ----
         std::copy(s.x.begin(), s.x.end(), s.xb.begin());
-        rms_norm(s.xb.data(), lw.attn_norm, E, s.rms_eps);
+        rms_norm_avx2(s.xb.data(), lw.attn_norm, E, s.rms_eps);
+        kQ8Quant(s.xq8(), s.xb.data(), E);
 
-        // ---- Q, K, V projections (dtype-aware GEMV) ----
-        gemv_wt(s.q.data(), lw.wq, s.xb.data(), H   * HD, E, pool);
-        gemv_wt(s.k.data(), lw.wk, s.xb.data(), KVH * HD, E, pool);
-        gemv_wt(s.v.data(), lw.wv, s.xb.data(), KVH * HD, E, pool);
+        // ---- Q, K, V projections (INT8 GEMV via Q8_0 input) ----
+        gemv_wt_q8(s.q.data(), lw.wq, s.xq8(), s.xb.data(), H   * HD, E, pool);
+        gemv_wt_q8(s.k.data(), lw.wk, s.xq8(), s.xb.data(), KVH * HD, E, pool);
+        gemv_wt_q8(s.v.data(), lw.wv, s.xq8(), s.xb.data(), KVH * HD, E, pool);
 
         // ---- Apply RoPE to Q and K ----
         apply_rope(s.q.data(), pos, H,   HD, s.rope_cache);
@@ -577,7 +859,7 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
         std::copy(s.k.begin(), s.k.end(), s.k_buf(l, pos));
         std::copy(s.v.begin(), s.v.end(), s.v_buf(l, pos));
 
-        // ---- GQA multi-head attention ----
+        // ---- GQA multi-head attention (Phase C: AVX2 dot + SAXPY) ----
         const int seq = pos + 1;
         const int kv_group = H / KVH;
         std::fill(s.attn_out.begin(), s.attn_out.end(), 0.f);
@@ -588,63 +870,192 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
 
             for (int t = 0; t < seq; t++) {
                 const float* K_t = s.k_buf(l, t) + kv_h * HD;
-                float score = 0.f;
-                for (int d = 0; d < HD; d++) score += Q_h[d] * K_t[d];
-                s.attn[t] = score * scale;
+                s.attn[t] = avx2_dot_f32(Q_h, K_t, HD) * scale;
             }
             softmax(s.attn.data(), seq);
 
             float* out_h = s.attn_out.data() + h * HD;
-            for (int t = 0; t < seq; t++) {
-                const float* V_t = s.v_buf(l, t) + kv_h * HD;
-                for (int d = 0; d < HD; d++) out_h[d] += s.attn[t] * V_t[d];
-            }
+            for (int t = 0; t < seq; t++)
+                avx2_saxpy(out_h, s.attn[t], s.v_buf(l, t) + kv_h * HD, HD);
         }
 
         // ---- Output projection + residual ----
-        gemv_wt(s.xb.data(), lw.wo, s.attn_out.data(), E, E, pool);
+        kQ8Quant(s.xq8(), s.attn_out.data(), E);
+        gemv_wt_q8(s.xb.data(), lw.wo, s.xq8(), s.attn_out.data(), E, E, pool);
         for (int i = 0; i < E; i++) s.x[i] += s.xb[i];
 
         // ---- RMSNorm (FFN) ----
         std::copy(s.x.begin(), s.x.end(), s.xb.begin());
-        rms_norm(s.xb.data(), lw.ffn_norm, E, s.rms_eps);
+        rms_norm_avx2(s.xb.data(), lw.ffn_norm, E, s.rms_eps);
+        kQ8Quant(s.xq8(), s.xb.data(), E);
 
-        // ---- SwiGLU FFN: gate and up projections (dtype-aware) ----
-        gemv_wt(s.gate.data(), lw.wgate, s.xb.data(), FD, E, pool);
-        gemv_wt(s.up.data(),   lw.wup,   s.xb.data(), FD, E, pool);
-        for (int i = 0; i < FD; i++) s.gate[i] = silu(s.gate[i]) * s.up[i];
+        // ---- SwiGLU FFN: gate and up projections (INT8 GEMV) ----
+        gemv_wt_q8(s.gate.data(), lw.wgate, s.xq8(), s.xb.data(), FD, E, pool);
+        gemv_wt_q8(s.up.data(),   lw.wup,   s.xq8(), s.xb.data(), FD, E, pool);
+        swiglu_avx2(s.gate.data(), s.up.data(), FD);
 
-        // ---- FFN down projection + residual ----
-        gemv_wt(s.ffn.data(), lw.wdown, s.gate.data(), E, FD, pool);
+        // ---- FFN down projection + residual (INT8 GEMV) ----
+        kQ8Quant(s.xq8(), s.gate.data(), FD);
+        gemv_wt_q8(s.ffn.data(), lw.wdown, s.xq8(), s.gate.data(), E, FD, pool);
         for (int i = 0; i < E; i++) s.x[i] += s.ffn[i];
     }
 
     // ── 3. Final RMSNorm ─────────────────────────────────────────────────────
-    rms_norm(s.x.data(), w.output_norm, E, s.rms_eps);
+    rms_norm_avx2(s.x.data(), w.output_norm, E, s.rms_eps);
 
-    // ── 4. LM head: logits[V] = output_w[V×E] × x (dtype-aware) ─────────────
-    gemv_wt(s.logits.data(), w.output, s.x.data(), s.n_vocab, E, pool);
+    // ── 4. LM head (INT8 GEMV) ────────────────────────────────────────────────
+    kQ8Quant(s.xq8(), s.x.data(), E);
+    gemv_wt_q8(s.logits.data(), w.output, s.xq8(), s.x.data(), s.n_vocab, E, pool);
+}
+
+// ─── Batched prefill forward pass (Phase B) ─────────────────────────────────
+// Processes T prompt tokens in one call, exploiting L3 cache amortization:
+// each weight matrix is warm in L3 while all T tokens are projected against it.
+// Only the last token's logits are computed (first generated token).
+static void llama_forward_batch(const int32_t* token_ids, int T,
+                                 int pos_start, LlamaState& s) {
+    const int E   = s.n_embd, H = s.n_heads, KVH = s.n_kv_heads;
+    const int HD  = s.head_dim, FD = s.ffn_dim;
+    const float scale = 1.f / std::sqrt((float)HD);
+    const LlamaWeights& w = s.weights;
+    ThreadPool* pool = s.pool.get();
+
+    std::vector<float> X(T * E), XB(T * E);
+    std::vector<float> Q(T * H * HD), K(T * KVH * HD), V(T * KVH * HD);
+    std::vector<float> AO(T * E);
+    std::vector<float> GATE(T * FD), UP(T * FD), FFN_BUF(T * E);
+
+    // Q8_0 scratch for T tokens — two buffers (E-dim and FD-dim inputs)
+    const bool have_avx2 = cpu_x86::cpu_features().avx2;
+    std::vector<uint8_t> xq8_e_buf, xq8_fd_buf;
+    block_q8_0 *XQ8_E = nullptr, *XQ8_FD = nullptr;
+    if (have_avx2) {
+        xq8_e_buf .resize(sizeof(block_q8_0) * (size_t)T * (E  / 32));
+        xq8_fd_buf.resize(sizeof(block_q8_0) * (size_t)T * (FD / 32));
+        XQ8_E  = reinterpret_cast<block_q8_0*>(xq8_e_buf .data());
+        XQ8_FD = reinterpret_cast<block_q8_0*>(xq8_fd_buf.data());
+    }
+    // Quantise T F32 rows of dimension `dim` into an XQ8 array
+    auto qbatch = [&](block_q8_0* xq8, const float* xf32, int dim) {
+        if (have_avx2)
+            for (int t = 0; t < T; t++)
+                cpu_x86::quantize_q8_avx2(xq8 + (size_t)t*(dim/32), xf32 + (size_t)t*dim, dim);
+    };
+
+    // Embedding lookup
+    for (int t = 0; t < T; t++)
+        emb_lookup(X.data() + (size_t)t*E, w.tok_embd, token_ids[t], E);
+
+    for (int l = 0; l < s.n_layer; l++) {
+        const LlamaLayerW& lw = w.layers[l];
+
+        // RMSNorm (attn)
+        for (int t = 0; t < T; t++) {
+            std::copy(X.data()+(size_t)t*E, X.data()+(size_t)(t+1)*E, XB.data()+(size_t)t*E);
+            rms_norm_avx2(XB.data()+(size_t)t*E, lw.attn_norm, E, s.rms_eps);
+        }
+        qbatch(XQ8_E, XB.data(), E);
+
+        // Q, K, V projections — true GEMM (all T tokens × weight matrix at once)
+        gemm_wt_q8(Q.data(),    lw.wq, XQ8_E, XB.data(), H*HD,   T, E, pool);
+        gemm_wt_q8(K.data(),    lw.wk, XQ8_E, XB.data(), KVH*HD, T, E, pool);
+        gemm_wt_q8(V.data(),    lw.wv, XQ8_E, XB.data(), KVH*HD, T, E, pool);
+
+        // RoPE + KV cache fill
+        for (int t = 0; t < T; t++) {
+            const int pos = pos_start + t;
+            apply_rope(Q.data()+(size_t)t*H*HD,   pos, H,   HD, s.rope_cache);
+            apply_rope(K.data()+(size_t)t*KVH*HD, pos, KVH, HD, s.rope_cache);
+            std::copy(K.data()+(size_t)t*KVH*HD, K.data()+(size_t)(t+1)*KVH*HD, s.k_buf(l,pos));
+            std::copy(V.data()+(size_t)t*KVH*HD, V.data()+(size_t)(t+1)*KVH*HD, s.v_buf(l,pos));
+        }
+
+        // Causal attention (each token t attends to positions 0..pos_start+t)
+        std::fill(AO.begin(), AO.end(), 0.f);
+        const int kv_group = H / KVH;
+        for (int t = 0; t < T; t++) {
+            const int pos = pos_start + t;
+            const int seq = pos + 1;
+            for (int h = 0; h < H; h++) {
+                const int kv_h = h / kv_group;
+                const float* Q_h = Q.data() + (size_t)t*H*HD + h*HD;
+                for (int tt = 0; tt < seq; tt++)
+                    s.attn[tt] = avx2_dot_f32(Q_h, s.k_buf(l,tt) + kv_h*HD, HD) * scale;
+                softmax(s.attn.data(), seq);
+                float* ao_h = AO.data() + (size_t)t*E + h*HD;
+                for (int tt = 0; tt < seq; tt++)
+                    avx2_saxpy(ao_h, s.attn[tt], s.v_buf(l,tt) + kv_h*HD, HD);
+            }
+        }
+
+        // Output projection — GEMM all T tokens
+        qbatch(XQ8_E, AO.data(), E);
+        gemm_wt_q8(XB.data(), lw.wo, XQ8_E, AO.data(), E, T, E, pool);
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < E; i++) X[(size_t)t*E+i] += XB[(size_t)t*E+i];
+
+        // RMSNorm (FFN)
+        for (int t = 0; t < T; t++) {
+            std::copy(X.data()+(size_t)t*E, X.data()+(size_t)(t+1)*E, XB.data()+(size_t)t*E);
+            rms_norm_avx2(XB.data()+(size_t)t*E, lw.ffn_norm, E, s.rms_eps);
+        }
+        qbatch(XQ8_E, XB.data(), E);
+
+        // FFN gate + up — GEMM all T tokens
+        gemm_wt_q8(GATE.data(), lw.wgate, XQ8_E, XB.data(), FD, T, E, pool);
+        gemm_wt_q8(UP.data(),   lw.wup,   XQ8_E, XB.data(), FD, T, E, pool);
+
+        // SwiGLU + FFN down — GEMM all T tokens
+        for (int t = 0; t < T; t++)
+            swiglu_avx2(GATE.data()+(size_t)t*FD, UP.data()+(size_t)t*FD, FD);
+        qbatch(XQ8_FD, GATE.data(), FD);
+        gemm_wt_q8(FFN_BUF.data(), lw.wdown, XQ8_FD, GATE.data(), E, T, FD, pool);
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < E; i++) X[(size_t)t*E+i] += FFN_BUF[(size_t)t*E+i];
+    }
+
+    // Final RMSNorm + lm_head for the last token only
+    const int last = T - 1;
+    rms_norm_avx2(X.data()+(size_t)last*E, w.output_norm, E, s.rms_eps);
+    // Reuse xq8_e_buf for single-token quantise (need 1 token × E/32 blocks)
+    block_q8_0* xq8_last = XQ8_E;  // first E/32 blocks of the E buffer
+    if (have_avx2) cpu_x86::quantize_q8_avx2(xq8_last, X.data()+(size_t)last*E, E);
+    gemv_wt_q8(s.logits.data(), w.output, xq8_last, X.data()+(size_t)last*E, s.n_vocab, E, pool);
+
+    // Copy last token residual into s.x so decode loop can continue seamlessly
+    std::copy(X.data()+(size_t)last*E, X.data()+(size_t)T*E, s.x.data());
 }
 
 // ─── Sampling (identical strategy to GPT-2 side) ─────────────────────────────
 
-static int sample_top_k(const float* logits, int n_vocab,
-                         int top_k, float temperature,
-                         std::mt19937& rng) {
-    // temperature==0 or top_k==1 → greedy argmax
-    if (temperature <= 0.f || top_k <= 1)
-        return static_cast<int>(std::max_element(logits, logits + n_vocab) - logits);
-    std::vector<std::pair<float, int>> scored(n_vocab);
+static int32_t sample(const float* logits, int n_vocab,
+                       int top_k, float top_p, float temperature,
+                       std::mt19937& rng) {
+    // Greedy if temperature==0
+    if (temperature <= 0.f)
+        return static_cast<int32_t>(std::max_element(logits, logits + n_vocab) - logits);
+
+    int k = (top_k > 0 && top_k < n_vocab) ? top_k : n_vocab;
+    std::vector<std::pair<float, int32_t>> scored(n_vocab);
     for (int i = 0; i < n_vocab; i++) scored[i] = {logits[i] / temperature, i};
-    if (top_k <= 1)
-        return std::max_element(scored.begin(), scored.end())->second;
-    int k = std::min(top_k, n_vocab);
     std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
+
     float mx = scored[0].first, sum = 0.f;
     std::vector<float> probs(k);
     for (int i = 0; i < k; i++) { probs[i] = std::exp(scored[i].first - mx); sum += probs[i]; }
     for (int i = 0; i < k; i++) probs[i] /= sum;
+
+    // nucleus (top-p) filtering
+    if (top_p < 1.0f) {
+        float cum = 0.f; int cut = k;
+        for (int i = 0; i < k; i++) { cum += probs[i]; if (cum >= top_p) { cut = i + 1; break; } }
+        sum = 0.f;
+        for (int i = 0; i < cut; i++) sum += probs[i];
+        for (int i = 0; i < cut; i++) probs[i] /= sum;
+        k = cut;
+    }
+
     std::uniform_real_distribution<float> dist(0.f, 1.f);
     float r = dist(rng), cum = 0.f;
     for (int i = 0; i < k; i++) { cum += probs[i]; if (r < cum) return scored[i].second; }
@@ -674,7 +1085,7 @@ std::vector<int32_t> llama_generate(const Engine& engine,
 
     const int n_threads = cfg.n_threads > 0
         ? cfg.n_threads
-        : std::min(8, (int)std::thread::hardware_concurrency() / 2);
+        : std::min(14, (int)std::thread::hardware_concurrency());
 
     LlamaState state(L, NC, E, H, KVH, V, FD, eps, rtheta, n_threads);
     state.weights = build_weights(engine, L);
@@ -685,32 +1096,62 @@ std::vector<int32_t> llama_generate(const Engine& engine,
     if (prompt_ids.empty() || prompt_ids[0] != bos)
         prompt_ids.insert(prompt_ids.begin(), bos);
 
-    // Prefill
-    for (int i = 0; i < (int)prompt_ids.size(); i++) {
-        llama_forward_token(prompt_ids[i], i, state);
-        state.n_past++;
-        if (cfg.verbose)
-            std::fprintf(stderr, "\r[LLaMA] prefill %d/%d", i+1, (int)prompt_ids.size());
+    // Prefill — batched when prompt > 1 token (Phase B)
+    const int nprompt = (int)prompt_ids.size();
+    if (nprompt > 1) {
+        llama_forward_batch(prompt_ids.data(), nprompt, 0, state);
+        state.n_past = nprompt;
+    } else {
+        llama_forward_token(prompt_ids[0], 0, state);
+        state.n_past = 1;
     }
-    if (cfg.verbose) std::fprintf(stderr, "\n");
+    if (cfg.verbose) {
+        const float* lp = state.logits.data();
+        std::vector<std::pair<float,int>> ranked(V);
+        for (int i = 0; i < V; i++) ranked[i] = {lp[i], i};
+        std::partial_sort(ranked.begin(), ranked.begin()+5, ranked.end(),
+                          [](const auto& a, const auto& b){ return a.first > b.first; });
+        std::fprintf(stderr, "[DBG] top-5 prefill:");
+        for (int i = 0; i < 5; i++)
+            std::fprintf(stderr, " %d(%.2f)", ranked[i].second, ranked[i].first);
+        std::fprintf(stderr, "\n");
+    }
 
     // Decode loop
     std::vector<int32_t> generated;
     generated.reserve(cfg.max_new_tokens);
 
-    int32_t next_id = sample_top_k(state.logits.data(), V,
-                                    cfg.top_k, cfg.temperature, rng);
+    // Repetition-penalty helper: divides logits of recently-seen tokens.
+    std::vector<int32_t> rep_ctx(prompt_ids.begin(), prompt_ids.end());
+    auto apply_rep_penalty = [&](float* lp) {
+        if (cfg.rep_penalty == 1.0f) return;
+        const int win   = std::min(cfg.rep_penalty_last_n, (int)rep_ctx.size());
+        const int start = (int)rep_ctx.size() - win;
+        for (int i = start; i < (int)rep_ctx.size(); i++) {
+            const int32_t id = rep_ctx[i];
+            if (id < 0 || id >= V) continue;
+            lp[id] = lp[id] > 0.f ? lp[id] / cfg.rep_penalty
+                                   : lp[id] * cfg.rep_penalty;
+        }
+    };
+
+    apply_rep_penalty(state.logits.data());
+    int32_t next_id = sample(state.logits.data(), V,
+                              cfg.top_k, cfg.top_p, cfg.temperature, rng);
 
     for (int step = 0; step < cfg.max_new_tokens; step++) {
+        if (next_id == engine.eos_id()) break;  // stop cleanly; EOS not emitted
+        if (state.n_past >= NC) break;
+
         generated.push_back(next_id);
         if (cfg.on_token) cfg.on_token(next_id);
-        if (next_id == engine.eos_id()) break;
-        if (state.n_past >= NC) break;
 
         llama_forward_token(next_id, state.n_past, state);
         state.n_past++;
-        next_id = sample_top_k(state.logits.data(), V,
-                                cfg.top_k, cfg.temperature, rng);
+        rep_ctx.push_back(next_id);
+        apply_rep_penalty(state.logits.data());
+        next_id = sample(state.logits.data(), V,
+                          cfg.top_k, cfg.top_p, cfg.temperature, rng);
     }
     return generated;
 }
@@ -723,9 +1164,26 @@ std::string llama_decode_tokens(const Engine& engine,
                                   const std::vector<int32_t>& token_ids) {
     const auto& vocab = engine.vocabulary();
     std::string out;
+    auto hex_digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
     for (int32_t id : token_ids) {
         if (id < 0 || id >= (int32_t)vocab.size()) continue;
         const std::string& tok = vocab[id];
+
+        // SentencePiece byte-fallback tokens: "<0xHH>" → emit raw byte
+        if (tok.size() == 6 &&
+            tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
+            int hi = hex_digit(tok[3]), lo = hex_digit(tok[4]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>((hi << 4) | lo);
+                continue;
+            }
+        }
+
         // Replace SentencePiece space marker ▁ (UTF-8: 0xE2 0x96 0x81)
         std::string s;
         s.reserve(tok.size());
@@ -747,43 +1205,114 @@ std::string llama_decode_tokens(const Engine& engine,
 }
 
 std::vector<int32_t> llama_encode_simple(const Engine& engine,
-                                           std::string_view text) {
+                                           std::string_view text, bool raw) {
     const auto& vocab = engine.vocabulary();
     if (vocab.empty())
         throw std::runtime_error("llama_encode_simple: vocabulary is empty");
 
-    // Build reverse map. LLaMA vocab tokens use ▁ for spaces; we normalise
-    // input spaces to ▁ so the lookup matches.
     std::unordered_map<std::string, int32_t> str_to_id;
     str_to_id.reserve(vocab.size());
     for (int32_t i = 0; i < (int32_t)vocab.size(); i++)
         str_to_id.emplace(vocab[i], i);
 
-    // SentencePiece convention: prepend ▁ to whole input so first word maps to
-    // e.g. "▁The" just like llama.cpp's add_space_prefix=true behaviour.
-    // Also replace every internal space with ▁.
-    std::string normalised = "\xE2\x96\x81";  // leading ▁
-    normalised.reserve(text.size() * 2 + 3);
-    for (char c : text) {
-        if (c == ' ')
-            normalised += "\xE2\x96\x81";  // ▁
-        else
-            normalised += c;
+    // Build byte-fallback map: raw byte value → token ID via "<0xHH>" entries.
+    std::array<int32_t, 256> byte_to_id;
+    byte_to_id.fill(-1);
+    {
+        char buf[8];
+        for (int b = 0; b < 256; b++) {
+            std::snprintf(buf, sizeof(buf), "<0x%02X>", b);
+            auto it = str_to_id.find(buf);
+            if (it != str_to_id.end()) byte_to_id[b] = it->second;
+        }
     }
 
-    // Greedy longest-match
-    std::vector<int32_t> ids;
-    size_t pos = 0;
-    while (pos < normalised.size()) {
-        size_t best_len = 0;
-        int32_t best_id  = -1;
-        const size_t max_len = std::min(normalised.size() - pos, size_t(64));
-        for (size_t len = max_len; len >= 1; len--) {
-            auto it = str_to_id.find(normalised.substr(pos, len));
-            if (it != str_to_id.end()) { best_len = len; best_id = it->second; break; }
+    // Normalise a text segment: replace spaces with ▁ (optionally prepend ▁).
+    auto normalise = [](std::string_view seg, bool prepend) -> std::string {
+        std::string out;
+        out.reserve(seg.size() * 2 + 3);
+        if (prepend) out += "\xE2\x96\x81";
+        for (char c : seg) {
+            if (c == ' ') out += "\xE2\x96\x81";
+            else          out += c;
         }
-        if (best_id < 0) pos++;
-        else { ids.push_back(best_id); pos += best_len; }
+        return out;
+    };
+
+    // BPE-encode a pre-normalised string segment, appending to `out`.
+    auto bpe_encode = [&](const std::string& norm, std::vector<int32_t>& out) {
+        size_t pos = 0;
+        while (pos < norm.size()) {
+            size_t best_len = 0;
+            int32_t best_id = -1;
+            const size_t max_len = std::min(norm.size() - pos, size_t(64));
+            for (size_t len = max_len; len >= 1; len--) {
+                auto it = str_to_id.find(norm.substr(pos, len));
+                if (it != str_to_id.end()) { best_len = len; best_id = it->second; break; }
+            }
+            if (best_id >= 0) { out.push_back(best_id); pos += best_len; }
+            else {
+                const auto b = static_cast<unsigned char>(norm[pos]);
+                if (byte_to_id[b] >= 0) out.push_back(byte_to_id[b]);
+                pos++;
+            }
+        }
+    };
+
+    std::vector<int32_t> ids;
+
+    if (!raw) {
+        // Plain-text mode: prepend leading ▁ and replace spaces.
+        bpe_encode(normalise(text, /*prepend=*/true), ids);
+        return ids;
+    }
+
+    // Raw / chat-template mode (parse_special=true):
+    // Pre-split the text at EOS/BOS string boundaries so that e.g. "</s>"
+    // is emitted as the dedicated EOS token ID even when immediately
+    // preceded by "." (which would otherwise form a merged BPE token ".</").
+    struct Special { std::string str; int32_t id; };
+    std::vector<Special> specials;
+    {
+        const int32_t eos = engine.eos_id(), bos = engine.bos_id();
+        if (eos >= 0 && eos < (int32_t)vocab.size() && !vocab[eos].empty())
+            specials.push_back({vocab[eos], eos});
+        if (bos >= 0 && bos < (int32_t)vocab.size() && !vocab[bos].empty())
+            specials.push_back({vocab[bos], bos});
+        std::sort(specials.begin(), specials.end(),
+                  [](const Special& a, const Special& b){ return a.str.size() > b.str.size(); });
+    }
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Check for a special token at current position.
+        bool matched = false;
+        for (const auto& sp : specials) {
+            if (pos + sp.str.size() <= text.size() &&
+                text.substr(pos, sp.str.size()) == sp.str) {
+                ids.push_back(sp.id);
+                pos += sp.str.size();
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Accumulate a regular-text segment up to the next special token.
+        std::string seg;
+        while (pos < text.size()) {
+            bool at_special = false;
+            for (const auto& sp : specials) {
+                if (pos + sp.str.size() <= text.size() &&
+                    text.substr(pos, sp.str.size()) == sp.str) {
+                    at_special = true; break;
+                }
+            }
+            if (at_special) break;
+            seg += text[pos++];
+        }
+        if (!seg.empty())
+            bpe_encode(normalise(seg, /*prepend=*/false), ids);
     }
     return ids;
 }

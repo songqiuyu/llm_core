@@ -21,6 +21,11 @@ CpuFeatures detect_cpu_features() noexcept {
         f.amx_int8  = (edx >> 25) & 1;
     }
 
+    // CPUID leaf 7, sub-leaf 1: AVX-VNNI (VEX-encoded, Alder Lake+)
+    if (__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) {
+        f.avxvnni = (eax >> 4) & 1;
+    }
+
     return f;
 }
 

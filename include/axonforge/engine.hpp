@@ -106,7 +106,7 @@ public:
 
     // ---- Tokenizer ----
     [[nodiscard]] std::vector<int32_t>
-        encode(std::string_view text, bool add_bos = true) const;
+        encode(std::string_view text, bool add_bos = true, bool raw = false) const;
     [[nodiscard]] std::string
         decode(std::span<const int32_t> token_ids) const;
     [[nodiscard]] int32_t bos_id()  const noexcept;
@@ -114,8 +114,9 @@ public:
     [[nodiscard]] int32_t vocab_size() const noexcept;
 
     // ---- Model info ----
-    [[nodiscard]] const ModelConfig& model_config() const noexcept;
+    [[nodiscard]] const ModelConfig&  model_config()  const noexcept;
     [[nodiscard]] const EngineConfig& engine_config() const noexcept;
+    [[nodiscard]] const std::string&  chat_template() const noexcept;
 
     // ---- Weight access (zero-copy views into mmap region) ----
     // Returns nullptr if name not found.

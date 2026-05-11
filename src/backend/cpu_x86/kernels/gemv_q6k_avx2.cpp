@@ -150,11 +150,96 @@ float q6k_dot_row_avx2(const uint8_t* row, const float* x, int in_dim) noexcept 
     return hsum256_q6_(_mm256_add_ps(acc0, acc1));
 }
 
+// ── 4-row simultaneous Q6K dot product ───────────────────────────────────────
+// Shares x loads and reconstructed nibble extraction amortised over 4 rows.
+// Each of the 4 rows has its own independent set of 2 AVX2 accumulators.
+static inline void q6k_dot_4rows_(float* y, int o,
+                                   const uint8_t* W, size_t row_bytes,
+                                   const float* x, int in_dim) noexcept {
+    __m256 a0a = _mm256_setzero_ps(), a0b = _mm256_setzero_ps();
+    __m256 a1a = _mm256_setzero_ps(), a1b = _mm256_setzero_ps();
+    __m256 a2a = _mm256_setzero_ps(), a2b = _mm256_setzero_ps();
+    __m256 a3a = _mm256_setzero_ps(), a3b = _mm256_setzero_ps();
+
+    const int nb = in_dim / QK_K_Q6_;
+    const __m256i mask_0F = _mm256_set1_epi8(0x0F);
+    const __m256i mask_03 = _mm256_set1_epi8(0x03);
+
+    const uint8_t* r0 = W + (size_t)(o + 0) * row_bytes;
+    const uint8_t* r1 = W + (size_t)(o + 1) * row_bytes;
+    const uint8_t* r2 = W + (size_t)(o + 2) * row_bytes;
+    const uint8_t* r3 = W + (size_t)(o + 3) * row_bytes;
+
+    for (int b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * QK_K_Q6_;
+
+        // Precompute d (super-scale) for each row
+        uint16_t d_bits[4];
+        memcpy(&d_bits[0], r0 + (size_t)b*Q6K_BYTES_ + 208, 2);
+        memcpy(&d_bits[1], r1 + (size_t)b*Q6K_BYTES_ + 208, 2);
+        memcpy(&d_bits[2], r2 + (size_t)b*Q6K_BYTES_ + 208, 2);
+        memcpy(&d_bits[3], r3 + (size_t)b*Q6K_BYTES_ + 208, 2);
+        const float d[4] = { f16c_q6_(d_bits[0]), f16c_q6_(d_bits[1]),
+                              f16c_q6_(d_bits[2]), f16c_q6_(d_bits[3]) };
+
+        const uint8_t* ql[4] = { r0+(size_t)b*Q6K_BYTES_,     r1+(size_t)b*Q6K_BYTES_,
+                                  r2+(size_t)b*Q6K_BYTES_,     r3+(size_t)b*Q6K_BYTES_ };
+        const uint8_t* qh[4] = { ql[0]+128, ql[1]+128, ql[2]+128, ql[3]+128 };
+        const int8_t*  sc[4] = { (const int8_t*)(ql[0]+192), (const int8_t*)(ql[1]+192),
+                                  (const int8_t*)(ql[2]+192), (const int8_t*)(ql[3]+192) };
+
+        for (int n = 0; n < 2; n++) {
+            const float* xp = xb + n * 128;
+
+            // Load and reconstruct Q6K streams for all 4 rows in this half
+            // Each row has independent q1..q4 reconstructed from ql_lo/ql_hi/qh
+            for (int r = 0; r < 4; r++) {
+                const uint8_t* ql_ptr = ql[r] + (size_t)n * 64;
+                const uint8_t* qh_ptr = qh[r] + (size_t)n * 32;
+                const int8_t*  sc_ptr = sc[r]  + n * 8;
+
+                const __m256i vql_lo = _mm256_loadu_si256((const __m256i*)ql_ptr);
+                const __m256i vql_hi = _mm256_loadu_si256((const __m256i*)(ql_ptr + 32));
+                const __m256i vqh    = _mm256_loadu_si256((const __m256i*)qh_ptr);
+
+                const __m256i q1 = _mm256_or_si256(
+                    _mm256_and_si256(vql_lo, mask_0F),
+                    _mm256_slli_epi16(_mm256_and_si256(vqh, mask_03), 4));
+                const __m256i q2 = _mm256_or_si256(
+                    _mm256_and_si256(vql_hi, mask_0F),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(vqh,2), mask_03), 4));
+                const __m256i q3 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(vql_lo, 4), mask_0F),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(vqh,4), mask_03), 4));
+                const __m256i q4 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(vql_hi, 4), mask_0F),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(vqh,6), mask_03), 4));
+
+                float dr = d[r];
+                __m256& aa = (r==0?a0a:(r==1?a1a:(r==2?a2a:a3a)));
+                __m256& ab = (r==0?a0b:(r==1?a1b:(r==2?a2b:a3b)));
+
+                accum_stream_q6_(q1, xp +   0, dr*(float)sc_ptr[0], dr*(float)sc_ptr[1], aa, ab);
+                accum_stream_q6_(q2, xp +  32, dr*(float)sc_ptr[2], dr*(float)sc_ptr[3], aa, ab);
+                accum_stream_q6_(q3, xp +  64, dr*(float)sc_ptr[4], dr*(float)sc_ptr[5], aa, ab);
+                accum_stream_q6_(q4, xp +  96, dr*(float)sc_ptr[6], dr*(float)sc_ptr[7], aa, ab);
+            }
+        }
+    }
+    y[o + 0] = hsum256_q6_(_mm256_add_ps(a0a, a0b));
+    y[o + 1] = hsum256_q6_(_mm256_add_ps(a1a, a1b));
+    y[o + 2] = hsum256_q6_(_mm256_add_ps(a2a, a2b));
+    y[o + 3] = hsum256_q6_(_mm256_add_ps(a3a, a3b));
+}
+
 // ── Range GEMV — called by ThreadPool workers ─────────────────────────────────
 void gemv_q6k_avx2_range(float* y, const uint8_t* W, const float* x,
                           int o_start, int o_end, int in_dim,
                           size_t row_bytes) noexcept {
-    for (int o = o_start; o < o_end; o++)
+    int o = o_start;
+    for (; o + 4 <= o_end; o += 4)
+        q6k_dot_4rows_(y, o, W, row_bytes, x, in_dim);
+    for (; o < o_end; o++)
         y[o] = q6k_dot_row_avx2(W + (size_t)o * row_bytes, x, in_dim);
 }
 

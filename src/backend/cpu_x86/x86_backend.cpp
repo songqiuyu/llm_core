@@ -40,9 +40,10 @@ public:
     bool initialize() override {
         const auto& f = cpu_features();
         if (f.avx2) {
-            printf("[AxonForge] x86 backend: AVX2%s%s enabled\n",
+            printf("[AxonForge] x86 backend: AVX2%s%s%s enabled\n",
+                   f.avxvnni    ? " + AVX-VNNI"   : "",
                    f.avx512f    ? " + AVX-512F"   : "",
-                   f.avx512vnni ? " + VNNI"        : "");
+                   f.avx512vnni ? " + AVX512-VNNI" : "");
         } else {
             printf("[AxonForge] x86 backend: SSE4.2 fallback (AVX2 not available)\n");
         }
