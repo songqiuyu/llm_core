@@ -1,10 +1,9 @@
 # AxonForge Inference Benchmark
 
-**Hardware**: Intel i9-12900K (8P+4E, AVX2/FMA/F16C), DDR4-3200 (51.2 GB/s)  
+**Hardware**: Intel i9-12900K (12P+4E, AVX2/FMA/F16C/AVX-VNNI), DDR4-3200 (51.2 GB/s)  
 **OS**: Ubuntu 22.04 / Linux 6.x  
-**Build**: Release, `-O3 -march=native`  
-**Precision**: F16 weights (float16)  
-**Threads**: 8 (physical P-cores)
+**Build**: Release (`-DCMAKE_BUILD_TYPE=Release`), `-O3 -mavx2 -mfma`  
+**Threads**: 16（默认；15 workers + 1 main，spinwait pool）
 
 ---
 
@@ -36,25 +35,29 @@
 
 ### TinyLlama-1.1B-Chat-v1.0 Q4_K_M
 
-| Metric | **Phase 3** | Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
-|--------|-------------|----------|----------|--------------------|---------------|
-| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
-| TTFT (7-token prompt) | **~884 ms** | ~2338 ms *(est.)* | ~7168 ms | ~34300 ms | ~35 ms |
-| Prefill speed | **~7.9 tok/s** | ~3.0 tok/s | ~1.0 tok/s | ~0.2 tok/s | — |
-| **Decode speed** | **~20.1 tok/s** | ~14.8 tok/s | ~4.96 tok/s | ~0.96 tok/s | ~26 tok/s |
-| Decode speedup vs 2b | **+36%** | — | — | — | — |
-| TTFT speedup vs 2b | **2.6×** | — | — | — | — |
+| Metric | **Phase 10** | Phase 9 | Phase 8 | Phase 7 | Phase 6 | Phase 5 | Phase 0 (scalar) | llama.cpp ref |
+|--------|-------------|---------|---------|---------|---------|---------|------------------|---------------|
+| Threads | **16** | 14 | 14 | 14 | 14 | 14 | 1 | 8 |
+| TTFT (warm, 8-token) | **~285 ms** ¹ | ~300 ms | ~114 ms ² | ~114 ms | ~100 ms | ~190 ms | ~34300 ms | ~35 ms |
+| Prefill speed (T=89) | **~102 tok/s** | ~102 tok/s | ~102 tok/s | ~102 tok/s | ~67 tok/s | ~40 tok/s | ~0.2 tok/s | ~400 tok/s |
+| **Decode speed** | **~75 tok/s** | ~69–70 tok/s | ~70–71 tok/s | ~68–70 tok/s | ~65.7 tok/s | ~25.5 tok/s | ~0.96 tok/s | ~77 tok/s |
+| vs llama.cpp decode | **~97%** | ~91% | ~91% | ~90% | ~85% | ~36% | ~1.4% | — |
+| 内存带宽利用率 | **~73%** ³ | ~90% | ~93% | ~91% | ~88% | ~34% | ~1.3% | ~100% |
+
+> ¹ Phase 10 TTFT 包含 Q4K→r8 重排（~130 ms）+ 线程池创建（~20 ms）；同进程第 2 次调用命中缓存时 TTFT 降至 ~150 ms。  
+> ² Phase 8 记录没有包含线程池创建开销，与 Phase 10 的重排计数方法不同。  
+> ³ Phase 10 带宽利用率下降原因：j=16 超过 DDR4 实际带宽极限，紧带宽场景下线程同步开销相对占比更高。
 
 ### LLaMA-2-7B Q4_K_M
 
-| Metric | **Phase 3** | Phase 2b | Phase 2a | Phase 0 (scalar) | llama.cpp ref |
-|--------|-------------|----------|----------|--------------------|---------------|
-| Precision | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M | Q4_K_M |
-| TTFT (7-token prompt) | **~3657 ms** | ~24017 ms *(est.)* | — | — | ~200 ms |
-| Prefill speed | **~1.9 tok/s** | ~0.3 tok/s | — | — | — |
-| **Decode speed** | **~5.0 tok/s** | ~1.79 tok/s | ~0.65 tok/s | ~0.18 tok/s | ~4 tok/s |
-| Decode speedup vs 2b | **+179%** | — | — | — | — |
-| TTFT speedup vs 2b | **6.6×** | — | — | — | — |
+| Metric | **Phase 8** | Phase 6 | Phase 5 | Phase 4 | Phase 3 | llama.cpp ref |
+|--------|-------------|---------|---------|---------|---------|---------------|
+| TTFT (warm, 4-token) | **~1.5 s** ¹ | ~1.5 s | ~2.4 s | ~2.4 s | ~3.7 s | ~200 ms |
+| Prefill speed | **~2.5 tok/s** | ~2.5 tok/s | ~2.9 tok/s | ~2.9 tok/s | ~1.9 tok/s | — |
+| **Decode speed** | **~11.5 tok/s** | ~10.9 tok/s | ~6.4 tok/s | ~6.1 tok/s | ~5.0 tok/s | ~15 tok/s |
+| vs Phase 6 | **+5%** | — | — | — | — | — |
+
+> ¹ Cold load adds ~10 s for 7B Q4K repacking.
 
 ### LLaMA-3.2-3B / LLaMA-3-8B
 
@@ -67,7 +70,32 @@
 
 ---
 
-## 3. Why AxonForge Is Faster
+## 3. Qwen / DeepSeek Smoke Results
+
+第一阶段目标是端到端跑通，不做 llama.cpp 全量性能对标。Qwen2.5 和 DeepSeek-R1-Distill-Qwen 复用现有 x86 Q4_K_M / Q6_K / F16 kernel、Q8 activation、Q4K r8 repack 和 spinwait ThreadPool，并补充 GGUF Q5_0 / Q8_0 权重读取。Q8_0 权重在 decode 阶段使用 AVX2 int8 dot，主要加速 Qwen/DeepSeek 的 LM head。
+
+| Model | Precision | Prompt | Result |
+|-------|-----------|--------|--------|
+| Qwen2.5-0.5B-Instruct | Q4_K_M | `"The capital of France is"` | PASS: 64 tokens, decode ~30.8 tok/s, TTFT ~352 ms, RSS ~450 MB |
+| DeepSeek-R1-Distill-Qwen-1.5B | Q4_K_M | `"What is 2+2?"` | PASS: generated “four”, 32 tokens, decode ~50.2 tok/s, TTFT ~552 ms, RSS ~1.57 GB |
+
+> Qwen2 r8 repack is speed-first: DeepSeek gains decode throughput (~31 → ~50 tok/s) but uses extra repack memory. For a strict low-memory mode, disable Qwen2 r8 in `build_weights()` and keep the F32 activation fallback.
+
+Commands:
+
+```bash
+build/tools/cli/axonforge-cli \
+    -m models/qwen2.5-0.5B/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" -n 16 -t 0.0
+
+build/tools/cli/axonforge-cli \
+    -m models/deepseek-r1-distill-qwen-1.5B/DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf \
+    -p "What is 2+2?" -n 32 -t 0.0
+```
+
+---
+
+## 4. Why AxonForge Is Faster
 
 | Optimisation | Phase | Benefit |
 |-------------|-------|---------|
@@ -76,15 +104,30 @@
 | **Pre-built weight pointer table** — `LlamaWeights` / `Gpt2Weights` | 1 | Eliminates snprintf + hashmap per token |
 | **RoPE cos/sin cache** — computed once at model load | 1 | Eliminates trigonometry in hot loop |
 | **AVX2 Q6K GEMV** — 6-bit quant kernel with 4-stream FMA | 2b | Enables Q6_K models |
-| **4-row GEMV tiling** (Q4K / Q6K / F16) — 4× wider ILP, 4× less x-vector bandwidth | **3A** | +36% decode TinyLlama, +179% LLaMA-2-7B |
-| **Batched prefill** — all prompt tokens processed per weight matrix (L3 reuse) | **3B** | 2.6× TTFT TinyLlama, 6.6× TTFT LLaMA-2-7B |
-| **AVX2 attention dot / SAXPY** — QK dot and V accumulation use FMA intrinsics | **3C** | ~5% attention speedup |
-
-**LLaMA-2-7B now exceeds llama.cpp** (5.0 vs ~4 tok/s) on the same hardware with 8 threads.
+| **4-row GEMV tiling** (Q4K / Q6K / F16) — 4× wider ILP, 4× less x-vector bandwidth | 3A | +36% decode TinyLlama, +179% LLaMA-2-7B |
+| **Batched prefill** — all prompt tokens processed per weight matrix (L3 reuse) | 3B | 2.6× TTFT TinyLlama, 6.6× TTFT LLaMA-2-7B |
+| **AVX2 attention dot / SAXPY** — QK dot and V accumulation use FMA intrinsics | 3C | ~5% attention speedup |
+| **AVX-VNNI Q4K INT8 path** — `dpbusd` replaces `maddubs+madd` | 5 | +9% decode |
+| **Release build** — fix Debug(-O0) regression on forward pass & thread pool lambda | **6** | +47% decode |
+| **Spinwait thread pool** — atomic generation counter, no futex; calling thread participates | **6** | +69% decode（barrier 500× 更快） |
+| **AVX2 SwiGLU** — Cephes exp2 polynomial, 8-wide SIMD sigmoid | **6** | 消除 ~4.9 ms/token scalar exp |
+| **AVX2 RMSNorm** — vectorised sum-of-squares + scale | **6** | 消除标量 RMSNorm 循环 |
+| **GEMV 内循环 _mm_prefetch** — Q4K outer block loop 预取下一块到 L1 (AVX2 + VNNI) | **7** | ~3–4% decode（减少 L3→L2 stall） |
+| **Fusion A: rms_norm_out** — 双输入 RMSNorm 消除 E=2048 副本 | **7** | 减少每层两次 8KB memcpy |
+| **Fusion C: gate+up+swiglu 单 parallel_for** — 22 层少 22 次 barrier | **7** | ~2% decode（减少 barrier + up[] L2 往返） |
+| **Fusion E: rope_and_store_k** — RoPE K 直接写入 KV cache | **7** | 消除 KVH×HD float 每层中间 copy |
+| **Q4K 8-row repack** (`block_q4_kx8`) — 行交织顺序布局消除 DDR4 行切换 | **8** | +5% decode 7B, +1–3% (1.1B) |
+| **VNNI r8 kernel** — `dpbusd` 替换 `maddubs+madd`（INT8 dot 2× 吞吐量） | **9** | 与 Phase 8 AVX2 r8 持平（VNNI hw 已 DDR4 饱和） |
+| **vector fnmadd min-correction** — `sum0f` 模式用 `_mm256_fnmadd_ps` 替代标量 hsum | **9** | 消除 `sum_q8` hsum 瓶颈，+1–2% |
+| **18-cache-line prefetch** — r8 内核预取覆盖完整 1152 字节 r8 block | **9** | 减少 L3→L2 stall，补全预取窗口 |
+| **j 默认化 16** — 匹配 i9-12900K P-core 逻辑 CPU 数 | **10** | +3–4 tok/s |
+| **Per-CPU 线程绑定** — worker[i]→CPU i，主线程→CPU n_workers | **10** | 消除 E-core 迁移和同 CPU 竞争，减少抖动 |
+| **静态权重缓存**（`WT::r8` 为 `shared_ptr`）— 同进程多次调用跳过 130 ms 重排 | **10** | TTFT 400 ms → 150 ms（同进程第二轮） |
+| **静态 ThreadPool 缓存** — worker 永久自旋，再次唤醒 <200 ns | **10** | TTFT 省去 ~20 ms 线程池重建开销 |
 
 ---
 
-## 4. Running the Benchmark
+## 5. Running the Benchmark
 
 ### Available GGUF Files
 
@@ -92,6 +135,8 @@
 |-------|------|------|------|--------|
 | TinyLlama-1.1B-Chat | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | ~670 MB | `models/tinyllama-1.1B/` | ✅ 可用 |
 | LLaMA-2-7B | `llama-2-7b.Q4_K_M.gguf` | ~3.8 GB | `models/llama-2-7B/` | ✅ 可用 |
+| Qwen2.5-0.5B-Instruct | `qwen2.5-0.5b-instruct-q4_k_m.gguf` | ~491 MB | `models/qwen2.5-0.5B/` | ✅ smoke passed |
+| DeepSeek-R1-Distill-Qwen-1.5B | `DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf` | ~1.12 GB | `models/deepseek-r1-distill-qwen-1.5B/` | ✅ smoke passed |
 | LLaMA-3.2-3B | `Llama-3.2-3B-F16.gguf` | 6.4 GB | `models/llama-3.2-3B/` | ⏳ 未下载 |
 | LLaMA-3-8B | `Meta-Llama-3-8B-F16.gguf` | 16.1 GB | `models/llama-3-8B/` | ⏳ 未下载 |
 
@@ -116,14 +161,27 @@ build/tools/cli/axonforge-cli \
 
 ---
 
-## 5. Phase 4 Roadmap (Next Targets)
+## 6. Phase 10 结果总结 & Phase 11 Roadmap
+
+### Phase 10 已完成（TinyLlama-1.1B Q4_K_M）
+
+| Feature | Status | Actual gain |
+|---------|--------|-------------|
+| j 默认化 14→16 | ✅ | +3–4 tok/s |
+| VNNI r8 kernel（`gemv_q4k_r8_avxvnni_range`） | ✅ | 持平 Phase 8（VNNI hw DDR4 饱和） |
+| vector fnmadd min-correction | ✅ | +1–2% |
+| 18-cache-line prefetch | ✅ | ~0.5% |
+| P-core 进程级 affinity + per-CPU 绑定 | ✅ | 减少抖动，均値 +1–2 tok/s |
+| 静态权重缓存（shared_ptr r8） | ✅ | 多轮 TTFT 直接命中，省 130 ms |
+| 静态 ThreadPool 缓存 | ✅ | 多轮省 ~20 ms |
+| **总计** | — | **~69 → ~75 tok/s (+8.4%)** |
+
+### Phase 11 Roadmap
 
 | Feature | Expected gain | Status |
 |---------|--------------|--------|
-| 4-row GEMV tiling (Q4K/Q6K/F16) | +36–179% decode | ✅ Phase 3A done |
-| Batched prefill | 2.6–6.6× TTFT | ✅ Phase 3B done |
-| AVX2 attention dot / SAXPY | ~5% attention | ✅ Phase 3C done |
-| AVX_VNNI INT8 kernel | ~2× decode vs AVX2 | ⏳ |
-| Multi-token decode (speculative) | ~3× decode | ⏳ |
-| Chat template support | usability | ⏳ |
-| CUDA backend (GTX 1080 Ti) | ~300–500 tok/s | ⏳ |
+| 磁盘缓存 repack buffers（.axon 缓存文件） | TTFT 冷启动 ~150 ms | ⏳ |
+| Prefill GEMM L2 blocking（T≥64 prompt） | ~2× prefill tok/s | ⏳ |
+| Q6K AVX-VNNI path | ~5%（Q6K models） | ⏳ |
+| 多轮 KV cache 持久化 API | 第二轮 TTFT 减少 KV alloc | ⏳ |
+| CUDA backend (GTX 1080 Ti) | ~5–8× decode | ⏳ |

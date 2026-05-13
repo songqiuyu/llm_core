@@ -82,6 +82,15 @@ struct BufWriter {
         pod(uint64_t(vals.size()));
         for (const auto& v : vals) str(v);
     }
+
+    void kv_i32_array(std::string_view key,
+                      const std::vector<int32_t>& vals) {
+        str(key);
+        pod(int32_t(9));   // GGUF_TYPE_ARRAY
+        pod(int32_t(5));   // elem = INT32
+        pod(uint64_t(vals.size()));
+        for (int32_t v : vals) pod(v);
+    }
 };
 
 // Build a minimal but complete GGUF v3 file:
@@ -128,6 +137,47 @@ std::vector<uint8_t> make_minimal_gguf() {
     return w.buf;
 }
 
+std::vector<uint8_t> make_qwen2_gguf() {
+    BufWriter w;
+
+    w.buf.insert(w.buf.end(), {'G','G','U','F'});
+    w.pod(uint32_t(3));
+    w.pod(int64_t(1));
+    w.pod(int64_t(14));
+
+    w.kv_str("general.architecture",   "qwen2");
+    w.kv_u64("qwen2.block_count",       24);
+    w.kv_u64("qwen2.embedding_length",  896);
+    w.kv_u64("qwen2.feed_forward_length", 4864);
+    w.kv_u64("qwen2.attention.head_count", 14);
+    w.kv_u64("qwen2.attention.head_count_kv", 2);
+    w.kv_u64("qwen2.context_length", 32768);
+    w.kv_f32("qwen2.attention.layer_norm_rms_epsilon", 1e-6f);
+    w.kv_f32("qwen2.rope.freq_base",    1000000.0f);
+    w.kv_u32("tokenizer.ggml.bos_token_id", 151643);
+    w.kv_u32("tokenizer.ggml.eos_token_id", 151645);
+    w.kv_str_array("tokenizer.ggml.tokens",
+        {"h","e","l","o","he","hel","hell","hello","<|im_start|>","<|im_end|>"});
+    w.kv_str_array("tokenizer.ggml.merges",
+        {"h e","he l","hel l","hell o"});
+    w.kv_i32_array("tokenizer.ggml.token_type",
+        {1,1,1,1,1,1,1,1,3,3});
+
+    w.str("weight.0");
+    w.pod(uint32_t(2));
+    w.pod(int64_t(4));
+    w.pod(int64_t(4));
+    w.pod(int32_t(0));
+    w.pod(uint64_t(0));
+
+    w.pad_to(32);
+    for (int i = 0; i < 16; ++i) {
+        float v = static_cast<float>(i);
+        w.pod(v);
+    }
+    return w.buf;
+}
+
 // RAII temp file
 struct TempFile {
     std::string path;
@@ -154,6 +204,7 @@ TEST_CASE("ggml_type_to_dtype maps known types", "[gguf][dtype]") {
     REQUIRE(ggml_type_to_dtype(0)  == DType::F32);
     REQUIRE(ggml_type_to_dtype(1)  == DType::F16);
     REQUIRE(ggml_type_to_dtype(2)  == DType::Q4_0);
+    REQUIRE(ggml_type_to_dtype(6)  == DType::Q5_0);
     REQUIRE(ggml_type_to_dtype(8)  == DType::Q8_0);
     REQUIRE(ggml_type_to_dtype(10) == DType::Q2_K);
     REQUIRE(ggml_type_to_dtype(11) == DType::Q3_K_M);
@@ -173,6 +224,8 @@ TEST_CASE("gguf_tensor_nbytes exact sizes", "[gguf][dtype]") {
     // Q4_0: 32-element blocks, 18 bytes/block
     REQUIRE(gguf_tensor_nbytes(DType::Q4_0, 32)  == 18);
     REQUIRE(gguf_tensor_nbytes(DType::Q4_0, 64)  == 36);
+    REQUIRE(gguf_tensor_nbytes(DType::Q5_0, 32)  == 22);
+    REQUIRE(gguf_tensor_nbytes(DType::Q5_0, 64)  == 44);
     // Q4_K_M: 256-element blocks, 144 bytes/block
     REQUIRE(gguf_tensor_nbytes(DType::Q4_K_M, 256) == 144);
     REQUIRE(gguf_tensor_nbytes(DType::Q4_K_M, 512) == 288);
@@ -218,6 +271,34 @@ TEST_CASE("Engine::from_gguf reads LLaMA hyperparams", "[gguf][engine]") {
     REQUIRE(mc.n_heads    == 4);
     REQUIRE(mc.head_dim   == 8);   // hidden_dim / n_heads = 32/4
     REQUIRE_THAT(mc.rope_theta, Catch::Matchers::WithinRel(500000.0f, 1e-5f));
+}
+
+TEST_CASE("Engine::from_gguf reads Qwen2 hyperparams", "[gguf][engine][qwen2]") {
+    const TempFile f(make_qwen2_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    const ModelConfig& mc = e.model_config();
+    REQUIRE(mc.arch       == "qwen2");
+    REQUIRE(mc.n_layers   == 24);
+    REQUIRE(mc.hidden_dim == 896);
+    REQUIRE(mc.ffn_dim    == 4864);
+    REQUIRE(mc.n_heads    == 14);
+    REQUIRE(mc.n_kv_heads == 2);
+    REQUIRE(mc.head_dim   == 64);
+    REQUIRE(mc.max_seq_len == 32768);
+    REQUIRE_THAT(mc.rope_theta, Catch::Matchers::WithinRel(1000000.0f, 1e-5f));
+    REQUIRE_THAT(mc.rms_norm_eps, Catch::Matchers::WithinRel(1e-6f, 1e-5f));
+}
+
+TEST_CASE("Qwen2 tokenizer parses BPE merges and special tokens", "[gguf][engine][qwen2]") {
+    const TempFile f(make_qwen2_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    auto ids = e.encode("hello", false);
+    REQUIRE(ids == std::vector<int32_t>{7});
+    REQUIRE(e.decode(ids) == "hello");
+
+    auto raw = e.encode("<|im_start|>hello<|im_end|>", false, true);
+    REQUIRE(raw == std::vector<int32_t>{8, 7, 9});
+    REQUIRE(e.decode(raw) == "hello");
 }
 
 TEST_CASE("Engine::from_gguf sets bos/eos token ids", "[gguf][engine]") {

@@ -136,5 +136,6 @@ TEST_CASE("dtype_is_float", "[dtype]") {
 TEST_CASE("dtype_is_quantized", "[dtype]") {
     REQUIRE(!dtype_is_quantized(DType::F32));
     REQUIRE( dtype_is_quantized(DType::Q4_K_M));
+    REQUIRE( dtype_is_quantized(DType::Q5_0));
     REQUIRE( dtype_is_quantized(DType::Q8_0));
 }

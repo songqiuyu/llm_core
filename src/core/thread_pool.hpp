@@ -22,6 +22,10 @@
 #include <immintrin.h>   // _mm_pause
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#  include <pthread.h>
+#  include <sched.h>
+#endif
 
 namespace axonforge {
 
@@ -30,8 +34,15 @@ public:
     explicit ThreadPool(int n_workers) {
         workers_.reserve(n_workers);
         for (int i = 0; i < n_workers; i++)
-            workers_.emplace_back([this, i] { worker_loop(i); });
+            workers_.emplace_back([this, i] { pin_to_cpu_(i); worker_loop(i); });
+        // Wait until all workers are spinning before returning
+        while (live_count_.load(std::memory_order_acquire) < n_workers)
+            _mm_pause();
     }
+
+    // Pin the calling thread to a specific logical CPU (call from llama_generate
+    // after pool construction to give the serial calling thread its own CPU).
+    static void pin_caller(int cpu_id) noexcept { pin_to_cpu_(cpu_id); }
 
     ~ThreadPool() {
         stop_.store(true, std::memory_order_relaxed);
@@ -76,13 +87,24 @@ private:
     std::atomic<int>              generation_{0};
     std::atomic<int>              pending_{0};
     std::atomic<bool>             stop_{false};
+    std::atomic<int>              live_count_{0};
 
     // Task descriptor — written before generation bump, read after acquire load
     std::function<void(int, int)> task_fn_;
     int  task_N_     = 0;
     int  task_chunk_ = 0;
 
+    static void pin_to_cpu_(int cpu_id) noexcept {
+#ifdef __linux__
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(cpu_id, &cs);
+        pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#endif
+    }
+
     void worker_loop(int id) {
+        live_count_.fetch_add(1, std::memory_order_release);
         int last_gen = 0;
         for (;;) {
             // Bounded spin (~0.5ms @ 10ns/pause), then yield to avoid OS starvation

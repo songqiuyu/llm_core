@@ -6,7 +6,10 @@
 #include "loader/gguf_reader.hpp"
 #include "axonforge/models/gpt2.hpp"
 #include "axonforge/models/llama.hpp"
+#include "axonforge/models/qwen2.hpp"
 #include <cstdio>
+#include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <memory>
 #include <unordered_map>
@@ -24,6 +27,9 @@ struct Engine::Impl {
     std::unique_ptr<GgufReader>            gguf;       // keeps mmap alive
     std::unordered_map<std::string,Tensor> weights;    // name → zero-copy mmap view
     std::vector<std::string>               vocabulary;   // token_id → token string
+    std::vector<std::string>               tokenizer_merges;
+    std::vector<int32_t>                   tokenizer_token_types;
+    std::string                            tokenizer_pre;
     std::string                            chat_template; // tokenizer.chat_template (Jinja2)
     int32_t                                bos_token_id{1};
     int32_t                                eos_token_id{2};
@@ -57,6 +63,15 @@ const Tensor* Engine::weight(std::string_view name) const noexcept {
 
 const std::vector<std::string>& Engine::vocabulary() const noexcept {
     return impl_->vocabulary;
+}
+const std::vector<std::string>& Engine::tokenizer_merges() const noexcept {
+    return impl_->tokenizer_merges;
+}
+const std::vector<int32_t>& Engine::tokenizer_token_types() const noexcept {
+    return impl_->tokenizer_token_types;
+}
+const std::string& Engine::tokenizer_pre() const noexcept {
+    return impl_->tokenizer_pre;
 }
 
 Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
@@ -126,9 +141,25 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
             impl->vocabulary = arr->strings;
         }
     }
+    if (const auto* v = impl->gguf->find_value("tokenizer.ggml.merges")) {
+        if (const auto* arr = std::get_if<GgufArray>(v)) {
+            impl->tokenizer_merges = arr->strings;
+        }
+    }
+    if (const auto* v = impl->gguf->find_value("tokenizer.ggml.token_type")) {
+        if (const auto* arr = std::get_if<GgufArray>(v)) {
+            impl->tokenizer_token_types.resize(arr->count);
+            const size_t n = std::min(arr->data.size() / sizeof(int32_t), arr->count);
+            if (n > 0) {
+                std::memcpy(impl->tokenizer_token_types.data(), arr->data.data(),
+                            n * sizeof(int32_t));
+            }
+        }
+    }
 
     // ---- Extract chat template ----
     impl->chat_template = impl->gguf->get_str("tokenizer.chat_template", "");
+    impl->tokenizer_pre = impl->gguf->get_str("tokenizer.ggml.pre", "");
 
     if (impl->engine_cfg.verbose) {
         const auto& mc = impl->model_cfg;
@@ -153,6 +184,8 @@ static bool is_llama_arch(const std::string& arch) {
 std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/, bool raw) const {
     if (impl_->model_cfg.arch == "gpt2")
         return gpt2_encode_simple(*this, text);
+    if (impl_->model_cfg.arch == "qwen2")
+        return qwen2_encode(*this, text, raw);
     if (is_llama_arch(impl_->model_cfg.arch))
         return llama_encode_simple(*this, text, raw);
     throw std::runtime_error(
@@ -162,6 +195,10 @@ std::string Engine::decode(std::span<const int32_t> ids) const {
     if (impl_->model_cfg.arch == "gpt2") {
         std::vector<int32_t> v(ids.begin(), ids.end());
         return gpt2_decode_tokens(*this, v);
+    }
+    if (impl_->model_cfg.arch == "qwen2") {
+        std::vector<int32_t> v(ids.begin(), ids.end());
+        return qwen2_decode(*this, v);
     }
     if (is_llama_arch(impl_->model_cfg.arch)) {
         std::vector<int32_t> v(ids.begin(), ids.end());
@@ -218,6 +255,16 @@ std::vector<int32_t> Session::generate(
         cfg.max_context_len = 4096;
         std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
         return llama_generate(eng, prompt, cfg);
+    }
+    if (eng.model_config().arch == "qwen2") {
+        Qwen2Config cfg;
+        cfg.max_new_tokens  = max_new_tokens;
+        cfg.temperature     = smp.temperature;
+        cfg.top_k           = smp.top_k > 0 ? smp.top_k : 40;
+        cfg.verbose         = eng.engine_config().verbose;
+        cfg.max_context_len = 4096;
+        std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        return qwen2_generate(eng, prompt, cfg);
     }
     throw std::runtime_error(
         "Session::generate: not implemented for arch '" +

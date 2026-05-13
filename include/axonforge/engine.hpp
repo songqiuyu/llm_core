@@ -125,6 +125,9 @@ public:
     // ---- Vocabulary ----
     // Returns the token vocabulary loaded from GGUF tokenizer.ggml.tokens.
     [[nodiscard]] const std::vector<std::string>& vocabulary() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& tokenizer_merges() const noexcept;
+    [[nodiscard]] const std::vector<int32_t>&     tokenizer_token_types() const noexcept;
+    [[nodiscard]] const std::string&              tokenizer_pre() const noexcept;
 
 private:
     struct Impl;

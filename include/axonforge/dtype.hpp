@@ -18,6 +18,7 @@ enum class DType : uint8_t {
     Q3_K_M = 11,
     Q2_K  = 12,
     Q6_K  = 13,
+    Q5_0  = 14,
     // Integer
     I32   = 16,
     I16   = 17,
@@ -37,6 +38,7 @@ enum class DType : uint8_t {
         case DType::BF16:   return 2;
         case DType::Q8_0:   return 1;   // approx; actual is block-based
         case DType::Q4_0:   return 1;   // approx (0.5 byte/element rounded up)
+        case DType::Q5_0:   return 1;   // approx
         case DType::Q4_K_M: return 1;   // approx
         case DType::Q3_K_M: return 1;   // approx
         case DType::Q2_K:   return 1;   // approx
@@ -49,7 +51,8 @@ enum class DType : uint8_t {
 }
 
 [[nodiscard]] constexpr bool dtype_is_quantized(DType dtype) noexcept {
-    return dtype >= DType::Q8_0 && dtype <= DType::Q2_K;
+    return (dtype >= DType::Q8_0 && dtype <= DType::Q6_K)
+        || dtype == DType::Q5_0;
 }
 
 [[nodiscard]] constexpr bool dtype_is_float(DType dtype) noexcept {
@@ -63,6 +66,7 @@ enum class DType : uint8_t {
         case DType::BF16:   return "bf16";
         case DType::Q8_0:   return "q8_0";
         case DType::Q4_0:   return "q4_0";
+        case DType::Q5_0:   return "q5_0";
         case DType::Q4_K_M: return "q4_k_m";
         case DType::Q3_K_M: return "q3_k_m";
         case DType::Q2_K:   return "q2_k";
@@ -105,6 +109,7 @@ enum class DType : uint8_t {
         case 0:  return DType::F32;
         case 1:  return DType::F16;
         case 2:  return DType::Q4_0;
+        case 6:  return DType::Q5_0;
         case 8:  return DType::Q8_0;
         case 10: return DType::Q2_K;
         case 11: return DType::Q3_K_M;
@@ -124,6 +129,7 @@ enum class DType : uint8_t {
 // Block sizes (GGML standard):
 //   Q8_0 : block=32  → 34 bytes/block  (2 B f16 scale + 32 B int8)
 //   Q4_0 : block=32  → 18 bytes/block  (2 B f16 delta + 16 B packed nibbles)
+//   Q5_0 : block=32  → 22 bytes/block  (2 B f16 delta + high bits + nibbles)
 //   Q4_K : block=256 → 144 bytes/block
 //   Q3_K : block=256 → 110 bytes/block
 //   Q2_K : block=256 →  84 bytes/block
@@ -139,6 +145,7 @@ enum class DType : uint8_t {
         case DType::I32:    return n * 4;
         case DType::Q8_0:   return ((n + 31)  / 32)  * 34;
         case DType::Q4_0:   return ((n + 31)  / 32)  * 18;
+        case DType::Q5_0:   return ((n + 31)  / 32)  * 22;
         case DType::Q4_K_M: return ((n + 255) / 256) * 144;
         case DType::Q3_K_M: return ((n + 255) / 256) * 110;
         case DType::Q2_K:   return ((n + 255) / 256) * 84;

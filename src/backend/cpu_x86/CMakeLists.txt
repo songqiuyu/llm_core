@@ -13,6 +13,7 @@ if(AXONFORGE_ENABLE_AVX2)
         kernels/gemv_q6k_avx2.cpp
         kernels/quant_q8_avx2.cpp
         kernels/gemv_q4k_q8_avx2.cpp
+        kernels/gemv_q4k_r8_avx2.cpp
         kernels/gemv_q6k_q8_avx2.cpp
         kernels/elementwise_avx2.cpp
         kernels/norm_avx2.cpp
@@ -30,6 +31,7 @@ endif()
 if(AXONFORGE_ENABLE_AVX2)
     add_library(axonforge_kernels_avxvnni OBJECT
         kernels/gemv_q4k_q8_avxvnni.cpp
+        kernels/gemv_q4k_r8_avxvnni.cpp
     )
     target_compile_options(axonforge_kernels_avxvnni PRIVATE -mavx2 -mfma -mf16c -mavxvnni -O3)
     target_include_directories(axonforge_kernels_avxvnni

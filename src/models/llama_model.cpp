@@ -30,6 +30,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#ifdef __linux__
+#  include <sched.h>
+#endif
 
 // Persistent thread pool (header-only)
 #include "../core/thread_pool.hpp"
@@ -76,6 +79,16 @@ namespace axonforge::cpu_x86 {
                                     const block_q8_0* XQ8,
                                     int M, int T, int K, size_t row_bytes,
                                     int o_start, int o_end) noexcept;
+    // ── 8-row repacked Q4K kernel ──────────────────────────────────────────
+    void repack_q4k_8rows(uint8_t* dst, const uint8_t* src,
+                          int nrows, int ncols) noexcept;
+    void gemv_q4k_r8_avx2_range(float* y, const uint8_t* R8,
+                                 const block_q8_0* xq8,
+                                 int o_start, int o_end, int in_dim) noexcept;
+    // AVX-VNNI 8-row kernel (gemv_q4k_r8_avxvnni.cpp, -mavxvnni)
+    void gemv_q4k_r8_avxvnni_range(float* y, const uint8_t* R8,
+                                    const block_q8_0* xq8,
+                                    int o_start, int o_end, int in_dim) noexcept;
 }
 
 namespace axonforge {
@@ -132,6 +145,153 @@ static void gemv_f16_dispatch(float* y, const uint16_t* W, const float* x,
         });
     } else {
         kLlamaGemvRange(y, W, x, b, 0, out, in);
+    }
+}
+
+static inline float q8_0_weight_dot_row(const uint8_t* row,
+                                         const float* x,
+                                         int in_dim) noexcept {
+    float acc = 0.f;
+    const int nb = (in_dim + 31) / 32;
+    for (int b = 0; b < nb; ++b) {
+        uint16_t d_bits;
+        std::memcpy(&d_bits, row + (size_t)b * 34, 2);
+        const float d = f16_to_f32(d_bits);
+        const int8_t* q = reinterpret_cast<const int8_t*>(row + (size_t)b * 34 + 2);
+        const int base = b * 32;
+        const int lim = std::min(32, in_dim - base);
+        for (int i = 0; i < lim; ++i)
+            acc += d * static_cast<float>(q[i]) * x[base + i];
+    }
+    return acc;
+}
+
+static inline float q8_0_weight_dot_q8_row(const uint8_t* row,
+                                            const block_q8_0* xq8,
+                                            int in_dim) noexcept {
+    float acc = 0.f;
+    const int nb = in_dim / 32;
+#if defined(__AVX2__)
+    const __m256i ones = _mm256_set1_epi16(1);
+#endif
+    for (int b = 0; b < nb; ++b) {
+        uint16_t d_bits;
+        std::memcpy(&d_bits, row + (size_t)b * 34, 2);
+        const float scale = f16_to_f32(d_bits) * xq8[b].d;
+        const int8_t* q = reinterpret_cast<const int8_t*>(row + (size_t)b * 34 + 2);
+#if defined(__AVX2__)
+        const __m256i qw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+        const __m256i qx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq8[b].qs));
+        const __m128i qw_lo_128 = _mm256_castsi256_si128(qw);
+        const __m128i qw_hi_128 = _mm256_extracti128_si256(qw, 1);
+        const __m128i qx_lo_128 = _mm256_castsi256_si128(qx);
+        const __m128i qx_hi_128 = _mm256_extracti128_si256(qx, 1);
+        const __m256i qw_lo = _mm256_cvtepi8_epi16(qw_lo_128);
+        const __m256i qw_hi = _mm256_cvtepi8_epi16(qw_hi_128);
+        const __m256i qx_lo = _mm256_cvtepi8_epi16(qx_lo_128);
+        const __m256i qx_hi = _mm256_cvtepi8_epi16(qx_hi_128);
+        const __m256i prod_lo = _mm256_mullo_epi16(qw_lo, qx_lo);
+        const __m256i prod_hi = _mm256_mullo_epi16(qw_hi, qx_hi);
+        const __m256i sum_lo = _mm256_madd_epi16(prod_lo, ones);
+        const __m256i sum_hi = _mm256_madd_epi16(prod_hi, ones);
+        __m256i sum = _mm256_add_epi32(sum_lo, sum_hi);
+        __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(sum),
+                                     _mm256_extracti128_si256(sum, 1));
+        s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
+        s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0xB1));
+        const int isum = _mm_cvtsi128_si32(s128);
+#else
+        int isum = 0;
+        for (int i = 0; i < 32; ++i)
+            isum += static_cast<int>(q[i]) * static_cast<int>(xq8[b].qs[i]);
+#endif
+        acc += scale * static_cast<float>(isum);
+    }
+    return acc;
+}
+
+static void gemv_q8_0_weight_q8(float* y,
+                                const uint8_t* W,
+                                const block_q8_0* xq8,
+                                int out,
+                                int in,
+                                ThreadPool* pool) noexcept {
+    const size_t row_bytes = (size_t)(in / 32) * 34;
+    if (pool && out >= 32) {
+        pool->parallel_for(out, [&](int s, int e) {
+            for (int o = s; o < e; ++o)
+                y[o] = q8_0_weight_dot_q8_row(W + (size_t)o * row_bytes, xq8, in);
+        });
+    } else {
+        for (int o = 0; o < out; ++o)
+            y[o] = q8_0_weight_dot_q8_row(W + (size_t)o * row_bytes, xq8, in);
+    }
+}
+
+static void q8_0_weight_row_to_f32(float* out,
+                                   const uint8_t* row,
+                                   int cols) noexcept {
+    const int nb = (cols + 31) / 32;
+    for (int b = 0; b < nb; ++b) {
+        uint16_t d_bits;
+        std::memcpy(&d_bits, row + (size_t)b * 34, 2);
+        const float d = f16_to_f32(d_bits);
+        const int8_t* q = reinterpret_cast<const int8_t*>(row + (size_t)b * 34 + 2);
+        const int base = b * 32;
+        const int lim = std::min(32, cols - base);
+        for (int i = 0; i < lim; ++i)
+            out[base + i] = d * static_cast<float>(q[i]);
+    }
+}
+
+static inline float q5_0_dot_row(const uint8_t* row,
+                                  const float* x,
+                                  int in_dim) noexcept {
+    float acc = 0.f;
+    const int nb = (in_dim + 31) / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* block = row + (size_t)b * 22;
+        uint16_t d_bits;
+        uint32_t qh;
+        std::memcpy(&d_bits, block, 2);
+        std::memcpy(&qh, block + 2, 4);
+        const float d = f16_to_f32(d_bits);
+        const uint8_t* qs = block + 6;
+        const int base = b * 32;
+        const int lim = std::min(32, in_dim - base);
+        for (int i = 0; i < lim; ++i) {
+            const uint8_t nib = (i < 16)
+                ? static_cast<uint8_t>(qs[i] & 0x0F)
+                : static_cast<uint8_t>(qs[i - 16] >> 4);
+            const uint8_t hi = static_cast<uint8_t>((qh >> i) & 1u);
+            const float w = d * (static_cast<float>(nib | (hi << 4)) - 16.f);
+            acc += w * x[base + i];
+        }
+    }
+    return acc;
+}
+
+static void q5_0_row_to_f32(float* out,
+                            const uint8_t* row,
+                            int cols) noexcept {
+    const int nb = (cols + 31) / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* block = row + (size_t)b * 22;
+        uint16_t d_bits;
+        uint32_t qh;
+        std::memcpy(&d_bits, block, 2);
+        std::memcpy(&qh, block + 2, 4);
+        const float d = f16_to_f32(d_bits);
+        const uint8_t* qs = block + 6;
+        const int base = b * 32;
+        const int lim = std::min(32, cols - base);
+        for (int i = 0; i < lim; ++i) {
+            const uint8_t nib = (i < 16)
+                ? static_cast<uint8_t>(qs[i] & 0x0F)
+                : static_cast<uint8_t>(qs[i - 16] >> 4);
+            const uint8_t hi = static_cast<uint8_t>((qh >> i) & 1u);
+            out[base + i] = d * (static_cast<float>(nib | (hi << 4)) - 16.f);
+        }
     }
 }
 
@@ -227,6 +387,32 @@ static void rms_norm_avx2(float* __restrict__ x,
         _mm256_storeu_ps(x + i, _mm256_mul_ps(wi, _mm256_mul_ps(xi, scale)));
     }
     for (; i < n; i++) x[i] = w[i] * x[i] * ss;
+}
+
+// ── AVX2 RMSNorm (2-input): reads from src, writes to dst — eliminates copy ──
+static void rms_norm_out(float* __restrict__ dst,
+                          const float* __restrict__ src,
+                          const float* __restrict__ w,
+                          int n, float eps) noexcept {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(src + i);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    float ss = 0.f;
+    float tmp[8]; _mm256_storeu_ps(tmp, acc);
+    for (int k = 0; k < 8; k++) ss += tmp[k];
+    for (; i < n; i++) ss += src[i] * src[i];
+    ss = 1.f / std::sqrt(ss / n + eps);
+    const __m256 scale = _mm256_set1_ps(ss);
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xi = _mm256_loadu_ps(src + i);
+        const __m256 wi = _mm256_loadu_ps(w   + i);
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(wi, _mm256_mul_ps(xi, scale)));
+    }
+    for (; i < n; i++) dst[i] = w[i] * src[i] * ss;
 }
 
 // ─── Softmax in-place ─────────────────────────────────────────────────────────
@@ -433,15 +619,26 @@ static const float* w_f32(const Engine& e, const char* name) {
 struct WT {
     const void* data{nullptr};
     DType       dtype{DType::UNKNOWN};
+    bool        q8_fast{true};
+    // For Q4K_M: 8-row interleaved repacked copy (same total bytes, sequential layout).
+    // Stored as shared_ptr so LlamaWeights can be cheaply copied (O(1) refcount bump)
+    // for the weight cache.  Non-null iff dtype==Q4_K_M and nrows%8==0.
+    std::shared_ptr<std::vector<uint8_t>> r8;
 };
 static WT make_wt(const Engine& e, const char* name) {
     const Tensor* t = w_req(e, name);
-    return {t->raw_data(), t->dtype()};
+    WT w;
+    w.data = t->raw_data();
+    w.dtype = t->dtype();
+    return w;
 }
 static WT make_wt_opt(const Engine& e, const char* name, const WT& fallback) {
     const Tensor* t = e.weight(name);
     if (!t) return fallback;
-    return {t->raw_data(), t->dtype()};
+    WT w;
+    w.data = t->raw_data();
+    w.dtype = t->dtype();
+    return w;
 }
 
 // Dispatch GEMV over dtype: F16 uses AVX2 kernel, Q4_K_M uses scalar dequant
@@ -476,6 +673,30 @@ static void gemv_wt(float* y, const WT& W, const float* x, int out, int in,
         } else {
             kQ6kRange(y, Wq, x, 0, out, in, row_bytes);
         }
+    } else if (W.dtype == DType::Q8_0) {
+        const uint8_t* Wq = static_cast<const uint8_t*>(W.data);
+        const size_t row_bytes = (size_t)((in + 31) / 32) * 34;
+        if (pool && out >= 32) {
+            pool->parallel_for(out, [&](int s, int e) {
+                for (int o = s; o < e; ++o)
+                    y[o] = q8_0_weight_dot_row(Wq + (size_t)o * row_bytes, x, in);
+            });
+        } else {
+            for (int o = 0; o < out; ++o)
+                y[o] = q8_0_weight_dot_row(Wq + (size_t)o * row_bytes, x, in);
+        }
+    } else if (W.dtype == DType::Q5_0) {
+        const uint8_t* Wq = static_cast<const uint8_t*>(W.data);
+        const size_t row_bytes = (size_t)((in + 31) / 32) * 22;
+        if (pool && out >= 32) {
+            pool->parallel_for(out, [&](int s, int e) {
+                for (int o = s; o < e; ++o)
+                    y[o] = q5_0_dot_row(Wq + (size_t)o * row_bytes, x, in);
+            });
+        } else {
+            for (int o = 0; o < out; ++o)
+                y[o] = q5_0_dot_row(Wq + (size_t)o * row_bytes, x, in);
+        }
     } else {
         // Fallback: treat as F16 (BF16 etc.)
         const uint16_t* Wf = static_cast<const uint16_t*>(W.data);
@@ -508,13 +729,44 @@ static const QuantQ8Fn kQ8Quant = cpu_x86::cpu_features().avx2
     ? cpu_x86::quantize_q8_avx2
     : kQ8Quant_scalar;
 
+// Runtime-selected Q4K×Q8_0 GEMV range (VNNI > AVX2) — used by fused gate+up lambda
+using Q4kQ8RangeFn = void(*)(float*, const uint8_t*, const block_q8_0*,
+                              int, int, int, size_t) noexcept;
+static const Q4kQ8RangeFn kQ4kQ8Range =
+    cpu_x86::cpu_features().avxvnni
+        ? cpu_x86::gemv_q4k_q8_avxvnni_range
+        : cpu_x86::gemv_q4k_q8_avx2_range;
+
 // ─── GEMV with Q8_0-quantised input (single token, Phase 4) ─────────────────
 // Uses maddubs INT8 path for Q4_K/Q6_K; falls back to FP32 gemv_wt for F16.
 static void gemv_wt_q8(float* y, const WT& W,
                         const block_q8_0* xq8, const float* xf32,
                         int out, int in, ThreadPool* pool) noexcept {
-    if (cpu_x86::cpu_features().avx2) {
+    if (W.q8_fast && cpu_x86::cpu_features().avx2) {
         if (W.dtype == DType::Q4_K_M) {
+            // ── Fast path: 8-row interleaved repacked kernel (AVX2 or AVX-VNNI) ──────
+            if (W.r8 && !W.r8->empty() && out % 8 == 0) {
+                const uint8_t* R8 = W.r8->data();
+                const int n8 = out / 8;  // number of 8-row groups
+                const bool vnni = cpu_x86::cpu_features().avxvnni;
+                if (pool && n8 >= 2) {
+                    pool->parallel_for(n8, [&](int gs, int ge) {
+                        if (vnni)
+                            cpu_x86::gemv_q4k_r8_avxvnni_range(y, R8, xq8,
+                                                                  gs*8, ge*8, in);
+                        else
+                            cpu_x86::gemv_q4k_r8_avx2_range(y, R8, xq8,
+                                                              gs*8, ge*8, in);
+                    });
+                } else {
+                    if (vnni)
+                        cpu_x86::gemv_q4k_r8_avxvnni_range(y, R8, xq8, 0, out, in);
+                    else
+                        cpu_x86::gemv_q4k_r8_avx2_range(y, R8, xq8, 0, out, in);
+                }
+                return;
+            }
+            // ── Fallback: 4-row scatter kernel (non-multiple-of-8, or no AVX2) ─
             const uint8_t* Wq        = static_cast<const uint8_t*>(W.data);
             const size_t   row_bytes = (size_t)(in / QK_K) * Q4K_BYTES;
             const bool     vnni      = cpu_x86::cpu_features().avxvnni;
@@ -545,6 +797,10 @@ static void gemv_wt_q8(float* y, const WT& W,
             }
             return;
         }
+        if (W.dtype == DType::Q8_0) {
+            gemv_q8_0_weight_q8(y, static_cast<const uint8_t*>(W.data), xq8, out, in, pool);
+            return;
+        }
     }
     gemv_wt(y, W, xf32, out, in, pool);
 }
@@ -556,7 +812,7 @@ static void gemv_wt_q8(float* y, const WT& W,
 static void gemm_wt_q8(float* Y, const WT& W,
                         const block_q8_0* XQ8, const float* XF32,
                         int M, int T, int in, ThreadPool* pool) noexcept {
-    if (cpu_x86::cpu_features().avx2) {
+    if (W.q8_fast && cpu_x86::cpu_features().avx2) {
         if (W.dtype == DType::Q4_K_M) {
             const uint8_t* Wq        = static_cast<const uint8_t*>(W.data);
             const size_t   row_bytes = (size_t)(in / QK_K) * Q4K_BYTES;
@@ -605,6 +861,16 @@ static void emb_lookup(float* out, const WT& W, int row, int cols) noexcept {
     } else if (W.dtype == DType::Q6_K) {
         const size_t row_bytes = (cols / QK_K) * Q6K_BYTES;
         q6k_row_to_f32(out, static_cast<const uint8_t*>(W.data) + (size_t)row * row_bytes, cols);
+    } else if (W.dtype == DType::Q8_0) {
+        const size_t row_bytes = (size_t)((cols + 31) / 32) * 34;
+        q8_0_weight_row_to_f32(out,
+            static_cast<const uint8_t*>(W.data) + (size_t)row * row_bytes,
+            cols);
+    } else if (W.dtype == DType::Q5_0) {
+        const size_t row_bytes = (size_t)((cols + 31) / 32) * 22;
+        q5_0_row_to_f32(out,
+            static_cast<const uint8_t*>(W.data) + (size_t)row * row_bytes,
+            cols);
     } else if (W.dtype == DType::Q4_K_M) {
         const size_t row_bytes = (cols / QK_K) * Q4K_BYTES;
         // Use Q4K dot trick: dot against all-ones → dequant
@@ -646,6 +912,9 @@ struct LlamaLayerW {
     const float* attn_norm;   // always F32
     const float* ffn_norm;    // always F32
     WT wq, wk, wv, wo;        // QKV + output projection
+    const float* bq{nullptr};
+    const float* bk{nullptr};
+    const float* bv{nullptr};
     WT wgate, wup, wdown;     // SwiGLU FFN
 };
 
@@ -656,24 +925,60 @@ struct LlamaWeights {
     std::vector<LlamaLayerW> layers;
 };
 
-static LlamaWeights build_weights(const Engine& e, int n_layer) {
+// Repack a Q4K_M weight matrix to 8-row interleaved format (same total bytes).
+// No-op if dtype is not Q4K or nrows is not a multiple of 8.
+static void repack_q4k_if_avx2(WT& w, int nrows, int ncols) noexcept {
+    if (w.dtype != DType::Q4_K_M || nrows % 8 != 0) return;
+    if (!cpu_x86::cpu_features().avx2) return;
+    const int nb = ncols / QK_K;
+    w.r8 = std::make_shared<std::vector<uint8_t>>((size_t)(nrows / 8) * nb * 1152);
+    cpu_x86::repack_q4k_8rows(w.r8->data(),
+                               static_cast<const uint8_t*>(w.data),
+                               nrows, ncols);
+}
+
+static LlamaWeights build_weights(const Engine& e, int n_layer,
+                                   int n_embd, int n_heads, int n_kv_heads,
+                                   int ffn_dim) {
     LlamaWeights w;
     w.tok_embd   = make_wt(e, "token_embd.weight");
     w.output_norm = w_f32(e, "output_norm.weight");
     w.output     = make_wt_opt(e, "output.weight", w.tok_embd);
     w.layers.resize(n_layer);
     char name[128];
+    const int hd   = n_embd / n_heads;      // head_dim
+    const int q_out   = n_heads    * hd;    // = n_embd
+    const int kv_out  = n_kv_heads * hd;
+    const bool enable_r8 = true;
+    const bool enable_q8_fast = true;
+    w.tok_embd.q8_fast = enable_q8_fast;
+    w.output.q8_fast = enable_q8_fast;
     for (int l = 0; l < n_layer; l++) {
         auto& lw = w.layers[l];
         std::snprintf(name, sizeof(name), "blk.%d.attn_norm.weight",  l); lw.attn_norm = w_f32(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight",   l); lw.ffn_norm  = w_f32(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.attn_q.weight",     l); lw.wq   = make_wt(e, name);
+        std::snprintf(name, sizeof(name), "blk.%d.attn_q.bias",       l); if (const Tensor* t = e.weight(name)) lw.bq = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_k.weight",     l); lw.wk   = make_wt(e, name);
+        std::snprintf(name, sizeof(name), "blk.%d.attn_k.bias",       l); if (const Tensor* t = e.weight(name)) lw.bk = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_v.weight",     l); lw.wv   = make_wt(e, name);
+        std::snprintf(name, sizeof(name), "blk.%d.attn_v.bias",       l); if (const Tensor* t = e.weight(name)) lw.bv = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_output.weight",l); lw.wo   = make_wt(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight",   l); lw.wgate = make_wt(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.ffn_up.weight",     l); lw.wup   = make_wt(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.ffn_down.weight",   l); lw.wdown = make_wt(e, name);
+        lw.wq.q8_fast = lw.wk.q8_fast = lw.wv.q8_fast = lw.wo.q8_fast = enable_q8_fast;
+        lw.wgate.q8_fast = lw.wup.q8_fast = lw.wdown.q8_fast = enable_q8_fast;
+        // Repack Q4K matrices to 8-row interleaved for faster decode GEMV
+        if (enable_r8) {
+            repack_q4k_if_avx2(lw.wq,    q_out,  n_embd);
+            repack_q4k_if_avx2(lw.wk,    kv_out, n_embd);
+            repack_q4k_if_avx2(lw.wv,    kv_out, n_embd);
+            repack_q4k_if_avx2(lw.wo,    n_embd, q_out);
+            repack_q4k_if_avx2(lw.wgate, ffn_dim, n_embd);
+            repack_q4k_if_avx2(lw.wup,   ffn_dim, n_embd);
+            repack_q4k_if_avx2(lw.wdown, n_embd, ffn_dim);
+        }
     }
     return w;
 }
@@ -719,6 +1024,38 @@ static void apply_rope(float* x, int pos, int n_heads, int head_dim,
     }
 }
 
+// Fusion E: apply RoPE to K and store directly into KV cache — eliminates k→cache copy
+static void rope_and_store_k(float* k_cache,
+                               const float* k_src,
+                               int pos, int n_heads, int head_dim,
+                               const RopeCache& cache) noexcept {
+    const int half = head_dim / 2;
+    const float* cos_row = cache.cos_cache.data() + (size_t)pos * half;
+    const float* sin_row = cache.sin_cache.data() + (size_t)pos * half;
+    for (int h = 0; h < n_heads; h++) {
+        const float* src = k_src   + h * head_dim;
+        float*       dst = k_cache + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float x0 = src[i];
+            float x1 = src[i + half];
+            dst[i]        = x0 * cos_row[i] - x1 * sin_row[i];
+            dst[i + half] = x0 * sin_row[i] + x1 * cos_row[i];
+        }
+    }
+}
+
+static inline void add_bias(float* y, const float* b, int n) noexcept {
+    if (!b) return;
+    for (int i = 0; i < n; ++i) y[i] += b[i];
+}
+
+static inline void add_bias_rows(float* y, const float* b, int rows, int n) noexcept {
+    if (!b) return;
+    for (int r = 0; r < rows; ++r)
+        for (int i = 0; i < n; ++i)
+            y[(size_t)r * n + i] += b[i];
+}
+
 // ─── Model state (KV cache + scratch buffers) ─────────────────────────────────
 
 struct LlamaState {
@@ -750,11 +1087,14 @@ struct LlamaState {
     // RoPE frequency cache
     RopeCache rope_cache;
 
-    // Thread pool
-    std::unique_ptr<ThreadPool> pool;
+    // Thread pool — owned_pool_ holds ownership when we create it ourselves;
+    // pool is the raw pointer used everywhere (may point to a static external pool).
+    std::unique_ptr<ThreadPool> owned_pool_;
+    ThreadPool* pool = nullptr;
 
     LlamaState(int nl, int nc, int ne, int nh, int nkv, int nv, int fd,
-               float eps, float rtheta, int n_threads)
+               float eps, float rtheta, int n_threads,
+               ThreadPool* ext_pool = nullptr)
         : n_layer(nl), n_ctx(nc), n_embd(ne), n_heads(nh), n_kv_heads(nkv)
         , head_dim(ne / nh), n_vocab(nv), ffn_dim(fd)
         , rms_eps(eps), rope_theta(rtheta)
@@ -772,8 +1112,11 @@ struct LlamaState {
         logits.resize(nv);
         xq8_scratch.resize(sizeof(block_q8_0) * (std::max(ne, fd) / 32));
         rope_cache.build(head_dim, rope_theta, nc);
-        if (n_threads > 1)
-            pool = std::make_unique<ThreadPool>(n_threads - 1); // +1 calling thread = n_threads total
+        if (ext_pool) {
+            pool = ext_pool;
+        } else if (n_threads > 1) {
+            pool = (owned_pool_ = std::make_unique<ThreadPool>(n_threads - 1)).get();
+        }
     }
 
     float* k_buf(int layer, int pos) {
@@ -832,7 +1175,7 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
     const int FD  = s.ffn_dim;
     const float scale = 1.f / std::sqrt((float)HD);
     const LlamaWeights& w = s.weights;
-    ThreadPool* pool = s.pool.get();
+    ThreadPool* pool = s.pool;
 
     // ── 1. Token embedding lookup (dtype-aware) ──────────────────────────────
     emb_lookup(s.x.data(), w.tok_embd, token_id, E);
@@ -841,25 +1184,25 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
     for (int l = 0; l < L; l++) {
         const LlamaLayerW& lw = w.layers[l];
 
-        // ---- RMSNorm (attention) ----
-        std::copy(s.x.begin(), s.x.end(), s.xb.begin());
-        rms_norm_avx2(s.xb.data(), lw.attn_norm, E, s.rms_eps);
+        // ---- RMSNorm (attention): Fusion A — read x, write xb without copy ----
+        rms_norm_out(s.xb.data(), s.x.data(), lw.attn_norm, E, s.rms_eps);
         kQ8Quant(s.xq8(), s.xb.data(), E);
 
         // ---- Q, K, V projections (INT8 GEMV via Q8_0 input) ----
         gemv_wt_q8(s.q.data(), lw.wq, s.xq8(), s.xb.data(), H   * HD, E, pool);
         gemv_wt_q8(s.k.data(), lw.wk, s.xq8(), s.xb.data(), KVH * HD, E, pool);
         gemv_wt_q8(s.v.data(), lw.wv, s.xq8(), s.xb.data(), KVH * HD, E, pool);
+        add_bias(s.q.data(), lw.bq, H   * HD);
+        add_bias(s.k.data(), lw.bk, KVH * HD);
+        add_bias(s.v.data(), lw.bv, KVH * HD);
 
-        // ---- Apply RoPE to Q and K ----
-        apply_rope(s.q.data(), pos, H,   HD, s.rope_cache);
-        apply_rope(s.k.data(), pos, KVH, HD, s.rope_cache);
-
-        // ---- Store K, V in cache ----
-        std::copy(s.k.begin(), s.k.end(), s.k_buf(l, pos));
+        // ---- RoPE Q in-place; Fusion E: RoPE K + store to cache in one pass ----
+        apply_rope(s.q.data(), pos, H, HD, s.rope_cache);
+        rope_and_store_k(s.k_buf(l, pos), s.k.data(), pos, KVH, HD, s.rope_cache);
         std::copy(s.v.begin(), s.v.end(), s.v_buf(l, pos));
 
         // ---- GQA multi-head attention (Phase C: AVX2 dot + SAXPY) ----
+        // Note: k_buf(l, pos) already contains RoPE-rotated K (via rope_and_store_k)
         const int seq = pos + 1;
         const int kv_group = H / KVH;
         std::fill(s.attn_out.begin(), s.attn_out.end(), 0.f);
@@ -884,15 +1227,47 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
         gemv_wt_q8(s.xb.data(), lw.wo, s.xq8(), s.attn_out.data(), E, E, pool);
         for (int i = 0; i < E; i++) s.x[i] += s.xb[i];
 
-        // ---- RMSNorm (FFN) ----
-        std::copy(s.x.begin(), s.x.end(), s.xb.begin());
-        rms_norm_avx2(s.xb.data(), lw.ffn_norm, E, s.rms_eps);
+        // ---- RMSNorm (FFN): Fusion A — read x, write xb without copy ----
+        rms_norm_out(s.xb.data(), s.x.data(), lw.ffn_norm, E, s.rms_eps);
         kQ8Quant(s.xq8(), s.xb.data(), E);
 
-        // ---- SwiGLU FFN: gate and up projections (INT8 GEMV) ----
-        gemv_wt_q8(s.gate.data(), lw.wgate, s.xq8(), s.xb.data(), FD, E, pool);
-        gemv_wt_q8(s.up.data(),   lw.wup,   s.xq8(), s.xb.data(), FD, E, pool);
-        swiglu_avx2(s.gate.data(), s.up.data(), FD);
+        // ---- SwiGLU FFN: Fusion C — gate+up+swiglu in single parallel_for ----
+        if (lw.wgate.q8_fast && lw.wgate.dtype == DType::Q4_K_M && pool && FD >= 32) {
+            float*            gate_ptr = s.gate.data();
+            float*            up_ptr   = s.up.data();
+            const block_q8_0* xq8p    = s.xq8();
+            if (lw.wgate.r8 && !lw.wgate.r8->empty() && FD % 8 == 0) {
+                // 8-row repacked path: distribute by group of 8 rows
+                const uint8_t* R8gate = lw.wgate.r8->data();
+                const uint8_t* R8up   = lw.wup.r8->data();
+                const int n8 = FD / 8;
+                const bool vnni_fc = cpu_x86::cpu_features().avxvnni;
+                pool->parallel_for(n8, [=](int gs, int ge) {
+                    const int s_r = gs*8, e_r = ge*8;
+                    if (vnni_fc) {
+                        cpu_x86::gemv_q4k_r8_avxvnni_range(gate_ptr, R8gate, xq8p, s_r, e_r, E);
+                        cpu_x86::gemv_q4k_r8_avxvnni_range(up_ptr,   R8up,   xq8p, s_r, e_r, E);
+                    } else {
+                        cpu_x86::gemv_q4k_r8_avx2_range(gate_ptr, R8gate, xq8p, s_r, e_r, E);
+                        cpu_x86::gemv_q4k_r8_avx2_range(up_ptr,   R8up,   xq8p, s_r, e_r, E);
+                    }
+                    swiglu_avx2(gate_ptr + s_r, up_ptr + s_r, e_r - s_r);
+                });
+            } else {
+                const uint8_t* Wgate  = static_cast<const uint8_t*>(lw.wgate.data);
+                const uint8_t* Wup    = static_cast<const uint8_t*>(lw.wup.data);
+                const size_t   rbytes = (size_t)(E / QK_K) * Q4K_BYTES;
+                pool->parallel_for(FD, [=](int s_r, int e_r) {
+                    kQ4kQ8Range(gate_ptr, Wgate, xq8p, s_r, e_r, E, rbytes);
+                    kQ4kQ8Range(up_ptr,   Wup,   xq8p, s_r, e_r, E, rbytes);
+                    swiglu_avx2(gate_ptr + s_r, up_ptr + s_r, e_r - s_r);
+                });
+            }
+        } else {
+            gemv_wt_q8(s.gate.data(), lw.wgate, s.xq8(), s.xb.data(), FD, E, pool);
+            gemv_wt_q8(s.up.data(),   lw.wup,   s.xq8(), s.xb.data(), FD, E, pool);
+            swiglu_avx2(s.gate.data(), s.up.data(), FD);
+        }
 
         // ---- FFN down projection + residual (INT8 GEMV) ----
         kQ8Quant(s.xq8(), s.gate.data(), FD);
@@ -918,7 +1293,7 @@ static void llama_forward_batch(const int32_t* token_ids, int T,
     const int HD  = s.head_dim, FD = s.ffn_dim;
     const float scale = 1.f / std::sqrt((float)HD);
     const LlamaWeights& w = s.weights;
-    ThreadPool* pool = s.pool.get();
+    ThreadPool* pool = s.pool;
 
     std::vector<float> X(T * E), XB(T * E);
     std::vector<float> Q(T * H * HD), K(T * KVH * HD), V(T * KVH * HD);
@@ -949,24 +1324,24 @@ static void llama_forward_batch(const int32_t* token_ids, int T,
     for (int l = 0; l < s.n_layer; l++) {
         const LlamaLayerW& lw = w.layers[l];
 
-        // RMSNorm (attn)
-        for (int t = 0; t < T; t++) {
-            std::copy(X.data()+(size_t)t*E, X.data()+(size_t)(t+1)*E, XB.data()+(size_t)t*E);
-            rms_norm_avx2(XB.data()+(size_t)t*E, lw.attn_norm, E, s.rms_eps);
-        }
+        // RMSNorm (attn): Fusion A — rms_norm_out reads X, writes XB without copy
+        for (int t = 0; t < T; t++)
+            rms_norm_out(XB.data()+(size_t)t*E, X.data()+(size_t)t*E, lw.attn_norm, E, s.rms_eps);
         qbatch(XQ8_E, XB.data(), E);
 
         // Q, K, V projections — true GEMM (all T tokens × weight matrix at once)
         gemm_wt_q8(Q.data(),    lw.wq, XQ8_E, XB.data(), H*HD,   T, E, pool);
         gemm_wt_q8(K.data(),    lw.wk, XQ8_E, XB.data(), KVH*HD, T, E, pool);
         gemm_wt_q8(V.data(),    lw.wv, XQ8_E, XB.data(), KVH*HD, T, E, pool);
+        add_bias_rows(Q.data(), lw.bq, T, H*HD);
+        add_bias_rows(K.data(), lw.bk, T, KVH*HD);
+        add_bias_rows(V.data(), lw.bv, T, KVH*HD);
 
-        // RoPE + KV cache fill
+        // RoPE + KV cache fill: Fusion E — RoPE K directly into cache
         for (int t = 0; t < T; t++) {
             const int pos = pos_start + t;
-            apply_rope(Q.data()+(size_t)t*H*HD,   pos, H,   HD, s.rope_cache);
-            apply_rope(K.data()+(size_t)t*KVH*HD, pos, KVH, HD, s.rope_cache);
-            std::copy(K.data()+(size_t)t*KVH*HD, K.data()+(size_t)(t+1)*KVH*HD, s.k_buf(l,pos));
+            apply_rope(Q.data()+(size_t)t*H*HD, pos, H, HD, s.rope_cache);
+            rope_and_store_k(s.k_buf(l,pos), K.data()+(size_t)t*KVH*HD, pos, KVH, HD, s.rope_cache);
             std::copy(V.data()+(size_t)t*KVH*HD, V.data()+(size_t)(t+1)*KVH*HD, s.v_buf(l,pos));
         }
 
@@ -994,11 +1369,9 @@ static void llama_forward_batch(const int32_t* token_ids, int T,
         for (int t = 0; t < T; t++)
             for (int i = 0; i < E; i++) X[(size_t)t*E+i] += XB[(size_t)t*E+i];
 
-        // RMSNorm (FFN)
-        for (int t = 0; t < T; t++) {
-            std::copy(X.data()+(size_t)t*E, X.data()+(size_t)(t+1)*E, XB.data()+(size_t)t*E);
-            rms_norm_avx2(XB.data()+(size_t)t*E, lw.ffn_norm, E, s.rms_eps);
-        }
+        // RMSNorm (FFN): Fusion A — rms_norm_out reads X, writes XB without copy
+        for (int t = 0; t < T; t++)
+            rms_norm_out(XB.data()+(size_t)t*E, X.data()+(size_t)t*E, lw.ffn_norm, E, s.rms_eps);
         qbatch(XQ8_E, XB.data(), E);
 
         // FFN gate + up — GEMM all T tokens
@@ -1085,10 +1458,41 @@ std::vector<int32_t> llama_generate(const Engine& engine,
 
     const int n_threads = cfg.n_threads > 0
         ? cfg.n_threads
-        : std::min(14, (int)std::thread::hardware_concurrency());
+        : std::min(16, (int)std::thread::hardware_concurrency());
 
-    LlamaState state(L, NC, E, H, KVH, V, FD, eps, rtheta, n_threads);
-    state.weights = build_weights(engine, L);
+    // Constrain all inference threads to CPUs 0..n_threads-1 (P-cores on Alder Lake)
+    // so the OS cannot migrate spinwait workers or the calling thread to E-cores.
+    // Worker threads inherit this affinity mask at creation inside LlamaState ctor.
+#ifdef __linux__
+    cpu_set_t orig_aff, infer_aff;
+    sched_getaffinity(0, sizeof(orig_aff), &orig_aff);
+    CPU_ZERO(&infer_aff);
+    for (int i = 0; i < n_threads; i++) CPU_SET(i, &infer_aff);
+    sched_setaffinity(0, sizeof(infer_aff), &infer_aff);
+#endif
+
+    // Weight cache: repacking ~520 MB of r8 buffers takes ~200 ms.
+    // Reuse across calls unless the engine pointer changes.
+    static const Engine*              s_wt_engine  = nullptr;
+    static LlamaWeights               s_wt_cache;
+    static std::unique_ptr<ThreadPool> s_pool;
+    static int                        s_pool_nw    = 0;
+    if (s_wt_engine != &engine) {
+        s_wt_cache  = build_weights(engine, L, E, H, KVH, FD);
+        s_wt_engine = &engine;
+    }
+    const int n_workers = n_threads - 1;
+    if (!s_pool || s_pool_nw != n_workers) {
+        s_pool    = std::make_unique<ThreadPool>(n_workers);
+        s_pool_nw = n_workers;
+    }
+    // Pin calling thread to CPU n_workers so it has an exclusive P-core
+    // (workers[i] are on CPUs 0..n_workers-1; caller gets CPU n_workers).
+    // This eliminates CPU sharing between the serial calling thread and any worker.
+    ThreadPool::pin_caller(n_workers);
+
+    LlamaState state(L, NC, E, H, KVH, V, FD, eps, rtheta, n_threads, s_pool.get());
+    state.weights = s_wt_cache;  // O(1): shared_ptr refcount bumps only
     std::mt19937 rng(42);
 
     // Prepend BOS token (id=1 for LLaMA-2/3/TinyLlama) if not already present
@@ -1153,6 +1557,11 @@ std::vector<int32_t> llama_generate(const Engine& engine,
         next_id = sample(state.logits.data(), V,
                           cfg.top_k, cfg.top_p, cfg.temperature, rng);
     }
+
+#ifdef __linux__
+    sched_setaffinity(0, sizeof(orig_aff), &orig_aff);
+#endif
+
     return generated;
 }
 

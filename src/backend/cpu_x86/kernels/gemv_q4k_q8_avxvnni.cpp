@@ -119,6 +119,11 @@ static float q4k_dot_q8_row_v_(const uint8_t* row,
         const uint8_t*    blk = row  + (size_t)b * Q4K_B_;
         const block_q8_0* xb  = xq8 + (size_t)b * 8;
 
+        if (b + 1 < nb) {
+            _mm_prefetch((const char*)(blk + Q4K_B_),      _MM_HINT_T0);
+            _mm_prefetch((const char*)(blk + Q4K_B_ + 64), _MM_HINT_T0);
+        }
+
         float ds[8], ms[8];
         load_scales_v_(blk, ds, ms);
 
@@ -160,6 +165,18 @@ static void q4k_4rows_q8_v_(float* y, int o,
 
     for (int b = 0; b < nb; b++) {
         const block_q8_0* xb = xq8 + (size_t)b * 8;
+
+        if (b + 1 < nb) {
+            const size_t np = (size_t)(b+1) * Q4K_B_;
+            _mm_prefetch((const char*)(r0 + np),      _MM_HINT_T0);
+            _mm_prefetch((const char*)(r0 + np + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(r1 + np),      _MM_HINT_T0);
+            _mm_prefetch((const char*)(r1 + np + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(r2 + np),      _MM_HINT_T0);
+            _mm_prefetch((const char*)(r2 + np + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(r3 + np),      _MM_HINT_T0);
+            _mm_prefetch((const char*)(r3 + np + 64), _MM_HINT_T0);
+        }
 
         float ds0[8],ms0[8], ds1[8],ms1[8], ds2[8],ms2[8], ds3[8],ms3[8];
         load_scales_v_(r0+(size_t)b*Q4K_B_, ds0, ms0);

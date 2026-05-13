@@ -31,6 +31,7 @@
 #include "axonforge/backend.hpp"
 #include "axonforge/models/gpt2.hpp"
 #include "axonforge/models/llama.hpp"
+#include "axonforge/models/qwen2.hpp"
 #include "axonforge/dtype.hpp"
 #include <chrono>
 #include <cstdio>
@@ -219,6 +220,16 @@ static void dispatch_generate(const axonforge::Engine& engine,
         cfg.top_k          = top_k;
         cfg.on_token       = std::move(on_token);
         axonforge::gpt2_generate(engine, prompt_ids, cfg);
+    } else if (arch == "qwen2") {
+        axonforge::Qwen2Config cfg;
+        cfg.max_new_tokens = max_new_tokens;
+        cfg.temperature    = temperature;
+        cfg.top_k          = top_k;
+        cfg.top_p          = top_p;
+        cfg.rep_penalty    = rep_penalty;
+        cfg.n_threads      = n_threads;
+        cfg.on_token       = std::move(on_token);
+        axonforge::qwen2_generate(engine, prompt_ids, cfg);
     } else {
         axonforge::LlamaConfig cfg;
         cfg.max_new_tokens = max_new_tokens;
@@ -305,10 +316,12 @@ generate_and_print(const axonforge::Engine& engine,
                 "\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n",
                 n_prompt, n_gen, ttft_ms, prefill_tps, decode_tps, total_ms, rss);
         } else {
+            const double decode_ms  = total_ms - ttft_ms;
+            const double decode_tps = (n_gen > 1 && decode_ms > 1.0)
+                ? (n_gen - 1) / (decode_ms / 1000.0) : 0.0;
             std::fprintf(stderr,
-                "[stats] TTFT: %.0f ms | %d tokens | %.2f tok/s\n",
-                ttft_ms, n_gen,
-                n_gen > 0 ? n_gen / (total_ms / 1000.0) : 0.0);
+                "[stats] TTFT: %.0f ms | %d tokens | decode: %.2f tok/s\n",
+                ttft_ms, n_gen, decode_tps);
         }
         if (colours) std::fprintf(stderr, "%s", COL_RESET);
     }
