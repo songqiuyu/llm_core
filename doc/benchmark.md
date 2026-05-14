@@ -126,7 +126,40 @@ llama.cpp baseline command:
 
 ---
 
-## 4. Why AxonForge Is Faster
+## 4. CUDA / RTX 4080 Benchmark Plan
+
+CUDA 后端使用 `AXONFORGE_ENABLE_CUDA=ON` 构建，RTX 4080 推荐 `AXONFORGE_CUDA_ARCH=89`。v1 已接入 backend lifecycle、device storage、CUDA tensor copy、RMSNorm/SwiGLU/RoPE 以及 Q4_K_M×F32 fused dequant GEMV 原型 kernel；完整 GPU-resident Qwen2 decoder forward 仍处于实验阶段。
+
+| Model | Backend | Prompt | TTFT | Prefill tok/s | Decode tok/s | VRAM | Status |
+|-------|---------|--------|------|---------------|--------------|------|--------|
+| Qwen2.5-3B-Instruct Q4_K_M | AxonForge CUDA | `"The capital of France is"` | TBD | TBD | TBD | TBD | build-cuda server validation pending |
+| Qwen2.5-3B-Instruct Q4_K_M | llama.cpp CUDA | same | TBD | TBD | TBD | TBD | fair baseline pending |
+
+AxonForge CUDA:
+
+```bash
+build-cuda/tools/cli/axonforge-cli \
+    -b cuda \
+    -m models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" \
+    -n 64 -t 0.0 -V
+```
+
+llama.cpp CUDA baseline:
+
+```bash
+./llama.cpp/build/bin/llama-cli \
+    -m models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" \
+    -n 64 -t 0.0 \
+    -c 4096 -ngl 999
+```
+
+公平性要求：同一 GGUF、同一 prompt、同一 context cap、同一生成 token 数；CPU baseline 记录 RSS，CUDA baseline 记录 peak VRAM。
+
+---
+
+## 5. Why AxonForge Is Faster
 
 | Optimisation | Phase | Benefit |
 |-------------|-------|---------|
@@ -158,7 +191,7 @@ llama.cpp baseline command:
 
 ---
 
-## 5. Running the Benchmark
+## 6. Running the Benchmark
 
 ### Available GGUF Files
 
@@ -196,7 +229,7 @@ build/tools/cli/axonforge-cli \
 
 ---
 
-## 6. Phase 10 结果总结 & Phase 11 Roadmap
+## 7. Phase 10 结果总结 & Phase 11 Roadmap
 
 ### Phase 10 已完成（TinyLlama-1.1B Q4_K_M）
 

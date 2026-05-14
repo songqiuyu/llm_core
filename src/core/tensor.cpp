@@ -124,6 +124,17 @@ Tensor Tensor::from_raw_blob(void* data, size_t nbytes,
     return Tensor(std::move(storage), shape, contiguous_strides(shape), 0, dtype);
 }
 
+Tensor Tensor::from_storage(std::shared_ptr<TensorStorage> storage,
+                            Shape shape,
+                            DType dtype) {
+    if (!storage) throw std::invalid_argument("Tensor::from_storage: null storage");
+    const size_t logical = static_cast<size_t>(::axonforge::numel(shape)) * dtype_element_size(dtype);
+    if (!dtype_is_quantized(dtype) && logical > storage->byte_size()) {
+        throw std::runtime_error("Tensor::from_storage: storage too small for tensor shape");
+    }
+    return Tensor(std::move(storage), shape, contiguous_strides(shape), 0, dtype);
+}
+
 // ---- Attributes ----
 
 const Shape&   Tensor::shape()   const noexcept { return shape_; }

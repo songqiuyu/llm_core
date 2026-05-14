@@ -10,6 +10,8 @@ add_subdirectory(cpu_x86)
 
 # ---- Future backend stubs (uncomment when implementing) ----
 # add_subdirectory(cpu_arm)
-# add_subdirectory(cuda)
+if(AXONFORGE_ENABLE_CUDA)
+    add_subdirectory(cuda)
+endif()
 # add_subdirectory(vulkan)
 # add_subdirectory(metal)

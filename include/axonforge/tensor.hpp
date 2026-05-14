@@ -50,6 +50,11 @@ public:
                                               Shape shape, DType dtype,
                                               DeviceId device = DeviceId::cpu());
 
+    // Wrap backend-owned storage. Used by non-CPU backends and tests.
+    [[nodiscard]] static Tensor from_storage(std::shared_ptr<TensorStorage> storage,
+                                             Shape shape,
+                                             DType dtype);
+
     // ---- Copy / move (cheap — only copies view metadata + increments refcount) ----
     Tensor(const Tensor&)            = default;
     Tensor(Tensor&&)                 = default;

@@ -1,6 +1,6 @@
 # AxonForge (llm_core)
 
-现代 C++20 端侧 LLM 推理引擎，x86 Linux 优先（AVX2 / FMA / F16C），支持 GPT-2、LLaMA-2、TinyLlama、Qwen2.5、DeepSeek-R1-Distill-Qwen、Hunyuan dense 等模型。
+现代 C++20 端侧 LLM 推理引擎，x86 Linux 优先（AVX2 / FMA / F16C），支持 GPT-2、LLaMA-2、TinyLlama、Qwen2.5、DeepSeek-R1-Distill-Qwen、Hunyuan dense 等模型，并提供实验 CUDA 后端。
 
 ---
 
@@ -13,6 +13,7 @@
 | CMake | ≥ 3.16 |
 | GCC / Clang | C++20 支持（GCC ≥ 11，Clang ≥ 13） |
 | CPU | AVX2 + FMA + F16C（Intel Haswell / AMD Zen 1 及以上） |
+| CUDA（可选） | CUDA Toolkit + cuBLAS，RTX 4080 推荐 `sm_89` |
 
 ### 编译步骤
 
@@ -28,6 +29,33 @@ ctest --test-dir build --output-on-failure
 ```
 
 > Debug 构建：将 `Release` 换成 `Debug`，会关闭 `-O3` 并保留调试符号。
+
+### CUDA 构建（实验）
+
+CUDA 后端默认关闭，不影响 CPU-only 构建。在 RTX 4080 服务器上推荐：
+
+```bash
+cmake -S . -B build-cuda \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DAXONFORGE_ENABLE_CUDA=ON \
+    -DAXONFORGE_CUDA_ARCH=89
+
+cmake --build build-cuda -j$(nproc)
+ctest --test-dir build-cuda --output-on-failure
+```
+
+运行时通过 `-b cuda` 选择 CUDA backend：
+
+```bash
+build-cuda/tools/cli/axonforge-cli \
+    -b cuda \
+    -m models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" -n 64 -t 0.0 -V
+```
+
+当前 CUDA v1 已包含 backend 注册、显存分配/拷贝、RMSNorm/SwiGLU 辅助 kernel、RoPE 和 Q4_K_M×F32 fused dequant GEMV 原型；完整 GPU-resident decoder forward 仍在推进中，`-b cuda -V` 会明确提示实验状态。
+
+更完整的 GPU 服务器构建、日志收集和 llama.cpp baseline 流程见 `doc/CUDA后端实现报告.md`。
 
 ---
 

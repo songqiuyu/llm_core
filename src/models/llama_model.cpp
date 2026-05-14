@@ -14,6 +14,9 @@
 
 #include "axonforge/engine.hpp"
 #include "axonforge/models/llama.hpp"
+#ifdef AXONFORGE_HAS_CUDA
+#include "axonforge/models/llama_cuda.hpp"
+#endif
 #include "axonforge/tensor.hpp"
 
 #include <algorithm>
@@ -1496,9 +1499,9 @@ static int32_t sample(const float* logits, int n_vocab,
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-std::vector<int32_t> llama_generate(const Engine& engine,
-                                     std::vector<int32_t> prompt_ids,
-                                     const LlamaConfig& cfg) {
+std::vector<int32_t> llama_generate_cpu_impl(const Engine& engine,
+                                             std::vector<int32_t> prompt_ids,
+                                             const LlamaConfig& cfg) {
     if (prompt_ids.empty())
         throw std::invalid_argument("llama_generate: empty prompt");
 
@@ -1625,6 +1628,17 @@ std::vector<int32_t> llama_generate(const Engine& engine,
 #endif
 
     return generated;
+}
+
+std::vector<int32_t> llama_generate(const Engine& engine,
+                                     std::vector<int32_t> prompt_ids,
+                                     const LlamaConfig& cfg) {
+#ifdef AXONFORGE_HAS_CUDA
+    if (engine.engine_config().backend == "cuda") {
+        return llama_cuda_generate(engine, std::move(prompt_ids), cfg);
+    }
+#endif
+    return llama_generate_cpu_impl(engine, std::move(prompt_ids), cfg);
 }
 
 // ─── Tokenization ─────────────────────────────────────────────────────────────

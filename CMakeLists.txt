@@ -21,6 +21,16 @@ option(AXONFORGE_BUILD_CLI      "Build CLI inference tool"  ON)
 option(AXONFORGE_ENABLE_AVX2    "Enable AVX2 + FMA"         ON)
 option(AXONFORGE_ENABLE_AVX512  "Enable AVX-512F + VNNI"    OFF)
 option(AXONFORGE_ENABLE_OPENMP  "Enable OpenMP threading"   ON)
+option(AXONFORGE_ENABLE_CUDA    "Enable CUDA backend"       OFF)
+set(AXONFORGE_CUDA_ARCH "89" CACHE STRING "CUDA architecture list, e.g. 89 for RTX 4080")
+
+if(AXONFORGE_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_ARCHITECTURES ${AXONFORGE_CUDA_ARCH})
+endif()
 
 # ---- Generate version header ----
 configure_file(
@@ -46,6 +56,7 @@ target_compile_options(axonforge_compile_options INTERFACE
 target_compile_definitions(axonforge_compile_options INTERFACE
     $<$<BOOL:${AXONFORGE_ENABLE_AVX2}>:AXONFORGE_HAS_AVX2>
     $<$<BOOL:${AXONFORGE_ENABLE_AVX512}>:AXONFORGE_HAS_AVX512>
+    $<$<BOOL:${AXONFORGE_ENABLE_CUDA}>:AXONFORGE_HAS_CUDA>
 )
 
 # ---- OpenMP ----

@@ -3,5 +3,6 @@ target_sources(axonforge PRIVATE
     llama_model.cpp
     qwen2_model.cpp
     hunyuan_dense_model.cpp
+    $<$<BOOL:${AXONFORGE_ENABLE_CUDA}>:llama_cuda_model.cpp>
     # gemma2_model.cpp  # TODO: Phase 1
 )
