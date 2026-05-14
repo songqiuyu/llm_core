@@ -30,6 +30,7 @@ struct ModelConfig {
     int  max_seq_len{4096};
     DType weight_dtype{DType::F16};
     float rope_theta{10000.0f};
+    float rope_scaling_alpha{0.0f};
     float rms_norm_eps{1e-5f};
 };
 

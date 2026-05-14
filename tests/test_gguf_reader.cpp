@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -178,6 +179,142 @@ std::vector<uint8_t> make_qwen2_gguf() {
     return w.buf;
 }
 
+std::vector<uint8_t> make_qwen2_3b_gguf() {
+    BufWriter w;
+
+    w.buf.insert(w.buf.end(), {'G','G','U','F'});
+    w.pod(uint32_t(3));
+    w.pod(int64_t(1));
+    w.pod(int64_t(14));
+
+    w.kv_str("general.architecture",   "qwen2");
+    w.kv_u64("qwen2.block_count",       36);
+    w.kv_u64("qwen2.embedding_length",  2048);
+    w.kv_u64("qwen2.feed_forward_length", 11008);
+    w.kv_u64("qwen2.attention.head_count", 16);
+    w.kv_u64("qwen2.attention.head_count_kv", 2);
+    w.kv_u64("qwen2.context_length", 32768);
+    w.kv_f32("qwen2.attention.layer_norm_rms_epsilon", 1e-6f);
+    w.kv_f32("qwen2.rope.freq_base",    1000000.0f);
+    w.kv_u32("tokenizer.ggml.bos_token_id", 151643);
+    w.kv_u32("tokenizer.ggml.eos_token_id", 151645);
+    w.kv_str_array("tokenizer.ggml.tokens",
+        {"h","e","l","o","he","hel","hell","hello","<|im_start|>","<|im_end|>"});
+    w.kv_str_array("tokenizer.ggml.merges",
+        {"h e","he l","hel l","hell o"});
+    w.kv_i32_array("tokenizer.ggml.token_type",
+        {1,1,1,1,1,1,1,1,3,3});
+
+    w.str("weight.0");
+    w.pod(uint32_t(2));
+    w.pod(int64_t(4));
+    w.pod(int64_t(4));
+    w.pod(int32_t(0));
+    w.pod(uint64_t(0));
+
+    w.pad_to(32);
+    for (int i = 0; i < 16; ++i) {
+        float v = static_cast<float>(i);
+        w.pod(v);
+    }
+    return w.buf;
+}
+
+std::vector<uint8_t> make_qwen3_4b_gguf() {
+    BufWriter w;
+
+    w.buf.insert(w.buf.end(), {'G','G','U','F'});
+    w.pod(uint32_t(3));
+    w.pod(int64_t(1));
+    w.pod(int64_t(16));
+
+    w.kv_str("general.architecture",   "qwen3");
+    w.kv_u64("qwen3.block_count",       36);
+    w.kv_u64("qwen3.embedding_length",  2560);
+    w.kv_u64("qwen3.feed_forward_length", 9728);
+    w.kv_u64("qwen3.attention.head_count", 32);
+    w.kv_u64("qwen3.attention.head_count_kv", 8);
+    w.kv_u64("qwen3.context_length", 32768);
+    w.kv_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6f);
+    w.kv_f32("qwen3.rope.freq_base",    1000000.0f);
+    w.kv_u32("tokenizer.ggml.bos_token_id", 151643);
+    w.kv_u32("tokenizer.ggml.eos_token_id", 151645);
+    w.kv_str_array("tokenizer.ggml.tokens",
+        {"h","e","l","o","he","hel","hell","hello","<|im_start|>","<|im_end|>"});
+    w.kv_str_array("tokenizer.ggml.merges",
+        {"h e","he l","hel l","hell o"});
+    w.kv_i32_array("tokenizer.ggml.token_type",
+        {1,1,1,1,1,1,1,1,3,3});
+    w.kv_str("tokenizer.ggml.pre", "qwen2");
+    w.kv_str("tokenizer.chat_template",
+             "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n");
+
+    w.str("weight.0");
+    w.pod(uint32_t(2));
+    w.pod(int64_t(4));
+    w.pod(int64_t(4));
+    w.pod(int32_t(0));
+    w.pod(uint64_t(0));
+
+    w.pad_to(32);
+    for (int i = 0; i < 16; ++i) {
+        float v = static_cast<float>(i);
+        w.pod(v);
+    }
+    return w.buf;
+}
+
+std::vector<uint8_t> make_hunyuan_dense_gguf() {
+    BufWriter w;
+
+    const std::string hy_user = "<\xEF\xBD\x9C" "hy_User" "\xEF\xBD\x9C" ">";
+    const std::string hy_asst = "<\xEF\xBD\x9C" "hy_Assistant" "\xEF\xBD\x9C" ">";
+    const std::string hy_end  = "<\xEF\xBD\x9C" "hy_place" "\xE2\x96\x81" "holder" "\xE2\x96\x81" "no" "\xE2\x96\x81" "2" "\xEF\xBD\x9C" ">";
+
+    w.buf.insert(w.buf.end(), {'G','G','U','F'});
+    w.pod(uint32_t(3));
+    w.pod(int64_t(1));
+    w.pod(int64_t(17));
+
+    w.kv_str("general.architecture",   "hunyuan-dense");
+    w.kv_u64("hunyuan-dense.block_count",       24);
+    w.kv_u64("hunyuan-dense.embedding_length",  2048);
+    w.kv_u64("hunyuan-dense.feed_forward_length", 5504);
+    w.kv_u64("hunyuan-dense.attention.head_count", 16);
+    w.kv_u64("hunyuan-dense.attention.head_count_kv", 8);
+    w.kv_u64("hunyuan-dense.context_length", 262144);
+    w.kv_f32("hunyuan-dense.attention.layer_norm_rms_epsilon", 1e-6f);
+    w.kv_f32("hunyuan-dense.rope.freq_base",    500000.0f);
+    w.kv_f32("hunyuan-dense.rope.scaling.alpha", 32.0f);
+    w.kv_u32("tokenizer.ggml.bos_token_id", 127960);
+    w.kv_u32("tokenizer.ggml.eos_token_id", 127967);
+    w.kv_str_array("tokenizer.ggml.tokens",
+        {"h","e","l","o","he","hel","hell","hello",
+         "1","2","3","12","123","4","\xC4\x8A",
+         "\xC3\xA4","\xC2\xBD","\xC5\x82",
+         hy_user, hy_asst, hy_end});
+    w.kv_str_array("tokenizer.ggml.merges",
+        {"h e","he l","hel l","hell o","1 2","12 3"});
+    w.kv_i32_array("tokenizer.ggml.token_type",
+        {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,3});
+    w.kv_str("tokenizer.ggml.pre", "hunyuan-dense");
+    w.kv_str("tokenizer.chat_template", "{{ hunyuan_dense }}");
+
+    w.str("weight.0");
+    w.pod(uint32_t(2));
+    w.pod(int64_t(4));
+    w.pod(int64_t(4));
+    w.pod(int32_t(0));
+    w.pod(uint64_t(0));
+
+    w.pad_to(32);
+    for (int i = 0; i < 16; ++i) {
+        float v = static_cast<float>(i);
+        w.pod(v);
+    }
+    return w.buf;
+}
+
 // RAII temp file
 struct TempFile {
     std::string path;
@@ -289,6 +426,42 @@ TEST_CASE("Engine::from_gguf reads Qwen2 hyperparams", "[gguf][engine][qwen2]") 
     REQUIRE_THAT(mc.rms_norm_eps, Catch::Matchers::WithinRel(1e-6f, 1e-5f));
 }
 
+TEST_CASE("Engine::from_gguf reads Qwen2.5 3B-style metadata", "[gguf][engine][qwen2][3b]") {
+    const TempFile f(make_qwen2_3b_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    const ModelConfig& mc = e.model_config();
+    REQUIRE(mc.arch       == "qwen2");
+    REQUIRE(mc.n_layers   == 36);
+    REQUIRE(mc.hidden_dim == 2048);
+    REQUIRE(mc.ffn_dim    == 11008);
+    REQUIRE(mc.n_heads    == 16);
+    REQUIRE(mc.n_kv_heads == 2);
+    REQUIRE(mc.head_dim   == 128);
+    REQUIRE(mc.max_seq_len == 32768);
+    REQUIRE(mc.vocab_size == 10);
+    REQUIRE_THAT(mc.rope_theta, Catch::Matchers::WithinRel(1000000.0f, 1e-5f));
+    REQUIRE_THAT(mc.rms_norm_eps, Catch::Matchers::WithinRel(1e-6f, 1e-5f));
+}
+
+TEST_CASE("Engine::from_gguf reads Qwen3 4B-style metadata", "[gguf][engine][qwen3][3b]") {
+    const TempFile f(make_qwen3_4b_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    const ModelConfig& mc = e.model_config();
+    REQUIRE(mc.arch       == "qwen3");
+    REQUIRE(mc.n_layers   == 36);
+    REQUIRE(mc.hidden_dim == 2560);
+    REQUIRE(mc.ffn_dim    == 9728);
+    REQUIRE(mc.n_heads    == 32);
+    REQUIRE(mc.n_kv_heads == 8);
+    REQUIRE(mc.head_dim   == 80);
+    REQUIRE(mc.max_seq_len == 32768);
+    REQUIRE(mc.vocab_size == 10);
+    REQUIRE(e.tokenizer_pre() == "qwen2");
+    REQUIRE_FALSE(e.chat_template().empty());
+    REQUIRE_THAT(mc.rope_theta, Catch::Matchers::WithinRel(1000000.0f, 1e-5f));
+    REQUIRE_THAT(mc.rms_norm_eps, Catch::Matchers::WithinRel(1e-6f, 1e-5f));
+}
+
 TEST_CASE("Qwen2 tokenizer parses BPE merges and special tokens", "[gguf][engine][qwen2]") {
     const TempFile f(make_qwen2_gguf());
     const Engine e = Engine::from_gguf(f.path, EngineConfig{});
@@ -298,6 +471,58 @@ TEST_CASE("Qwen2 tokenizer parses BPE merges and special tokens", "[gguf][engine
 
     auto raw = e.encode("<|im_start|>hello<|im_end|>", false, true);
     REQUIRE(raw == std::vector<int32_t>{8, 7, 9});
+    REQUIRE(e.decode(raw) == "hello");
+}
+
+TEST_CASE("Qwen3 reuses Qwen BPE special-token tokenizer path", "[gguf][engine][qwen3]") {
+    const TempFile f(make_qwen3_4b_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    auto ids = e.encode("hello", false);
+    REQUIRE(ids == std::vector<int32_t>{7});
+    REQUIRE(e.decode(ids) == "hello");
+
+    auto raw = e.encode("<|im_start|>hello<|im_end|>", false, true);
+    REQUIRE(raw == std::vector<int32_t>{8, 7, 9});
+    REQUIRE(e.decode(raw) == "hello");
+}
+
+TEST_CASE("Engine::from_gguf reads Hunyuan dense metadata", "[gguf][engine][hunyuan]") {
+    const TempFile f(make_hunyuan_dense_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    const ModelConfig& mc = e.model_config();
+    REQUIRE(mc.arch       == "hunyuan-dense");
+    REQUIRE(mc.n_layers   == 24);
+    REQUIRE(mc.hidden_dim == 2048);
+    REQUIRE(mc.ffn_dim    == 5504);
+    REQUIRE(mc.n_heads    == 16);
+    REQUIRE(mc.n_kv_heads == 8);
+    REQUIRE(mc.head_dim   == 128);
+    REQUIRE(mc.max_seq_len == 262144);
+    REQUIRE(mc.vocab_size == 21);
+    REQUIRE(e.tokenizer_pre() == "hunyuan-dense");
+    REQUIRE_FALSE(e.chat_template().empty());
+    REQUIRE_THAT(mc.rope_scaling_alpha, Catch::Matchers::WithinRel(32.0f, 1e-5f));
+    const float expected_theta = 500000.0f * std::pow(32.0f, 128.0f / 126.0f);
+    REQUIRE_THAT(mc.rope_theta, Catch::Matchers::WithinRel(expected_theta, 1e-5f));
+    REQUIRE_THAT(mc.rms_norm_eps, Catch::Matchers::WithinRel(1e-6f, 1e-5f));
+}
+
+TEST_CASE("Hunyuan dense tokenizer handles text and special tokens", "[gguf][engine][hunyuan]") {
+    const TempFile f(make_hunyuan_dense_gguf());
+    const Engine e = Engine::from_gguf(f.path, EngineConfig{});
+    auto ids = e.encode("hello1234\n", false);
+    REQUIRE(ids == std::vector<int32_t>{7, 12, 13, 14});
+    REQUIRE(e.decode(ids) == "hello1234\n");
+
+    const std::string ni = "\xE4\xBD\xA0";
+    auto zh = e.encode(ni, false);
+    REQUIRE(zh == std::vector<int32_t>{15, 16, 17});
+    REQUIRE(e.decode(zh) == ni);
+
+    const std::string hy_user = "<\xEF\xBD\x9C" "hy_User" "\xEF\xBD\x9C" ">";
+    const std::string hy_asst = "<\xEF\xBD\x9C" "hy_Assistant" "\xEF\xBD\x9C" ">";
+    auto raw = e.encode(hy_user + "hello" + hy_asst, false, true);
+    REQUIRE(raw == std::vector<int32_t>{18, 7, 19});
     REQUIRE(e.decode(raw) == "hello");
 }
 

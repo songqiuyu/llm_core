@@ -70,7 +70,7 @@
 
 ---
 
-## 3. Qwen / DeepSeek Smoke Results
+## 3. Qwen / DeepSeek / Hunyuan Smoke Results
 
 第一阶段目标是端到端跑通，不做 llama.cpp 全量性能对标。Qwen2.5 和 DeepSeek-R1-Distill-Qwen 复用现有 x86 Q4_K_M / Q6_K / F16 kernel、Q8 activation、Q4K r8 repack 和 spinwait ThreadPool，并补充 GGUF Q5_0 / Q8_0 权重读取。Q8_0 权重在 decode 阶段使用 AVX2 int8 dot，主要加速 Qwen/DeepSeek 的 LM head。
 
@@ -78,6 +78,10 @@
 |-------|-----------|--------|--------|
 | Qwen2.5-0.5B-Instruct | Q4_K_M | `"The capital of France is"` | PASS: 64 tokens, decode ~30.8 tok/s, TTFT ~352 ms, RSS ~450 MB |
 | DeepSeek-R1-Distill-Qwen-1.5B | Q4_K_M | `"What is 2+2?"` | PASS: generated “four”, 32 tokens, decode ~50.2 tok/s, TTFT ~552 ms, RSS ~1.57 GB |
+| Qwen2.5-3B-Instruct | Q4_K_M | `"The capital of France is"` | TBD: 3B target, expected to reuse `qwen2` path |
+| Qwen2.5-Coder-3B-Instruct | Q4_K_M | Python Fibonacci prompt | TBD: 3B code target, expected to reuse `qwen2` path |
+| Qwen3-4B | Q4_K_M | `"What is 2+2? /no_think"` | TBD: experimental `qwen3` dense path with Q/K norm |
+| Hunyuan-1.8B-Instruct | Q4_K_M | `"/no_think What is the capital of France?"` | TBD: experimental `hunyuan-dense` path with RoPE-after Q/K norm |
 
 > Qwen2 r8 repack is speed-first: DeepSeek gains decode throughput (~31 → ~50 tok/s) but uses extra repack memory. For a strict low-memory mode, disable Qwen2 r8 in `build_weights()` and keep the F32 activation fallback.
 
@@ -91,6 +95,33 @@ build/tools/cli/axonforge-cli \
 build/tools/cli/axonforge-cli \
     -m models/deepseek-r1-distill-qwen-1.5B/DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf \
     -p "What is 2+2?" -n 32 -t 0.0
+
+build/tools/cli/axonforge-cli \
+    -m models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" -n 64 -t 0.0 -V
+
+build/tools/cli/axonforge-cli \
+    -m models/qwen2.5-coder-3B/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+    -p "Write a Python function that returns the nth Fibonacci number." -n 96 -t 0.0 -V
+
+build/tools/cli/axonforge-cli \
+    -m models/qwen3-4B/Qwen3-4B-Q4_K_M.gguf \
+    -p "What is 2+2? /no_think" -n 64 -t 0.7 --top-k 20 --top-p 0.8 --rep-penalty 1.5 -V
+
+build/tools/cli/axonforge-cli \
+    -m models/hunyuan-1.8B/hunyuan-1.8b-instruct-q4_k_m.gguf \
+    -p "/no_think What is the capital of France?" -n 64 -t 0.0 -V
+```
+
+公平 benchmark 规则：AxonForge 与 llama.cpp 必须使用同一 GGUF、同一 prompt、同一线程数、同一 context cap、同一生成 token 数，并分别记录 TTFT、prefill tok/s、decode tok/s、RSS。单次 CLI smoke 不再作为性能对标结论。
+
+llama.cpp baseline command:
+
+```bash
+./llama.cpp/build/bin/llama-cli \
+    -m models/hunyuan-1.8B/hunyuan-1.8b-instruct-q4_k_m.gguf \
+    -p "/no_think What is the capital of France?" -n 64 -t 0.0 \
+    -c 4096 -t 16 --no-warmup --perf
 ```
 
 ---
@@ -137,6 +168,10 @@ build/tools/cli/axonforge-cli \
 | LLaMA-2-7B | `llama-2-7b.Q4_K_M.gguf` | ~3.8 GB | `models/llama-2-7B/` | ✅ 可用 |
 | Qwen2.5-0.5B-Instruct | `qwen2.5-0.5b-instruct-q4_k_m.gguf` | ~491 MB | `models/qwen2.5-0.5B/` | ✅ smoke passed |
 | DeepSeek-R1-Distill-Qwen-1.5B | `DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf` | ~1.12 GB | `models/deepseek-r1-distill-qwen-1.5B/` | ✅ smoke passed |
+| Qwen2.5-3B-Instruct | `qwen2.5-3b-instruct-q4_k_m.gguf` | ~2.1 GB | `models/qwen2.5-3B/` | ⏳ 待下载/smoke |
+| Qwen2.5-Coder-3B-Instruct | `qwen2.5-coder-3b-instruct-q4_k_m.gguf` | ~2.1 GB | `models/qwen2.5-coder-3B/` | ⏳ 待下载/smoke |
+| Qwen3-4B | `Qwen3-4B-Q4_K_M.gguf` | ~2.5 GB | `models/qwen3-4B/` | 🧪 experimental |
+| Hunyuan-1.8B-Instruct | `hunyuan-1.8b-instruct-q4_k_m.gguf` | ~1.13 GB | `models/hunyuan-1.8B/` | 🧪 experimental |
 | LLaMA-3.2-3B | `Llama-3.2-3B-F16.gguf` | 6.4 GB | `models/llama-3.2-3B/` | ⏳ 未下载 |
 | LLaMA-3-8B | `Meta-Llama-3-8B-F16.gguf` | 16.1 GB | `models/llama-3-8B/` | ⏳ 未下载 |
 

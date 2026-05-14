@@ -7,8 +7,10 @@
 #include "axonforge/models/gpt2.hpp"
 #include "axonforge/models/llama.hpp"
 #include "axonforge/models/qwen2.hpp"
+#include "axonforge/models/hunyuan_dense.hpp"
 #include <cstdio>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <memory>
@@ -93,9 +95,14 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
     mcfg.max_seq_len = static_cast<int>(gguf->get_u64(arch + ".context_length", 4096));
     mcfg.rms_norm_eps= gguf->get_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     mcfg.rope_theta  = gguf->get_f32(arch + ".rope.freq_base", 10000.0f);
+    mcfg.rope_scaling_alpha = gguf->get_f32(arch + ".rope.scaling.alpha", 0.0f);
 
     if (mcfg.n_heads > 0 && mcfg.hidden_dim > 0)
         mcfg.head_dim = mcfg.hidden_dim / mcfg.n_heads;
+    if (arch == "hunyuan-dense" && mcfg.rope_scaling_alpha > 0.0f && mcfg.head_dim > 2) {
+        mcfg.rope_theta *= std::pow(mcfg.rope_scaling_alpha,
+            static_cast<float>(mcfg.head_dim) / static_cast<float>(mcfg.head_dim - 2));
+    }
 
     // vocab_size = length of tokenizer.ggml.tokens array
     const size_t vocab_count = gguf->get_array_count("tokenizer.ggml.tokens");
@@ -176,6 +183,14 @@ Engine Engine::from_gguf(std::string_view path, EngineConfig cfg) {
 }
 
 // Helper: is this a LLaMA-family arch string?
+static bool is_qwen_arch(const std::string& arch) {
+    return arch == "qwen2" || arch == "qwen3";
+}
+
+static bool is_hunyuan_dense_arch(const std::string& arch) {
+    return arch == "hunyuan-dense";
+}
+
 static bool is_llama_arch(const std::string& arch) {
     return arch == "llama" || arch == "llama2" || arch == "llama3"
         || arch == "mistral" || arch == "tinyllama";
@@ -184,8 +199,10 @@ static bool is_llama_arch(const std::string& arch) {
 std::vector<int32_t> Engine::encode(std::string_view text, bool /*add_bos*/, bool raw) const {
     if (impl_->model_cfg.arch == "gpt2")
         return gpt2_encode_simple(*this, text);
-    if (impl_->model_cfg.arch == "qwen2")
+    if (is_qwen_arch(impl_->model_cfg.arch))
         return qwen2_encode(*this, text, raw);
+    if (is_hunyuan_dense_arch(impl_->model_cfg.arch))
+        return hunyuan_dense_encode(*this, text, raw);
     if (is_llama_arch(impl_->model_cfg.arch))
         return llama_encode_simple(*this, text, raw);
     throw std::runtime_error(
@@ -196,9 +213,13 @@ std::string Engine::decode(std::span<const int32_t> ids) const {
         std::vector<int32_t> v(ids.begin(), ids.end());
         return gpt2_decode_tokens(*this, v);
     }
-    if (impl_->model_cfg.arch == "qwen2") {
+    if (is_qwen_arch(impl_->model_cfg.arch)) {
         std::vector<int32_t> v(ids.begin(), ids.end());
         return qwen2_decode(*this, v);
+    }
+    if (is_hunyuan_dense_arch(impl_->model_cfg.arch)) {
+        std::vector<int32_t> v(ids.begin(), ids.end());
+        return hunyuan_dense_decode(*this, v);
     }
     if (is_llama_arch(impl_->model_cfg.arch)) {
         std::vector<int32_t> v(ids.begin(), ids.end());
@@ -256,7 +277,7 @@ std::vector<int32_t> Session::generate(
         std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
         return llama_generate(eng, prompt, cfg);
     }
-    if (eng.model_config().arch == "qwen2") {
+    if (is_qwen_arch(eng.model_config().arch)) {
         Qwen2Config cfg;
         cfg.max_new_tokens  = max_new_tokens;
         cfg.temperature     = smp.temperature;
@@ -265,6 +286,19 @@ std::vector<int32_t> Session::generate(
         cfg.max_context_len = 4096;
         std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
         return qwen2_generate(eng, prompt, cfg);
+    }
+    if (is_hunyuan_dense_arch(eng.model_config().arch)) {
+        HunyuanDenseConfig cfg;
+        cfg.max_new_tokens  = max_new_tokens;
+        cfg.temperature     = smp.temperature;
+        cfg.top_k           = smp.top_k > 0 ? smp.top_k : 40;
+        cfg.verbose         = eng.engine_config().verbose;
+        cfg.max_context_len = 4096;
+        cfg.top_p           = smp.top_p;
+        cfg.rep_penalty     = smp.rep_penalty;
+        cfg.rep_penalty_last_n = smp.rep_context_window;
+        std::vector<int32_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        return hunyuan_dense_generate(eng, prompt, cfg);
     }
     throw std::runtime_error(
         "Session::generate: not implemented for arch '" +

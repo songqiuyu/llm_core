@@ -1,6 +1,6 @@
 # AxonForge (llm_core)
 
-现代 C++20 端侧 LLM 推理引擎，x86 Linux 优先（AVX2 / FMA / F16C），支持 GPT-2、LLaMA-2、TinyLlama、Qwen2.5、DeepSeek-R1-Distill-Qwen 等模型。
+现代 C++20 端侧 LLM 推理引擎，x86 Linux 优先（AVX2 / FMA / F16C），支持 GPT-2、LLaMA-2、TinyLlama、Qwen2.5、DeepSeek-R1-Distill-Qwen、Hunyuan dense 等模型。
 
 ---
 
@@ -23,7 +23,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 # 多核编译
 cmake --build build -j$(nproc)
 
-# 运行单元测试（当前 49/49 通过）
+# 运行单元测试（当前 54/54 通过）
 ctest --test-dir build --output-on-failure
 ```
 
@@ -98,6 +98,36 @@ hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
     --local-dir models/qwen2.5-0.5B
 ```
 
+### Qwen2.5-3B-Instruct（Q4_K_M GGUF）
+
+```bash
+mkdir -p models/qwen2.5-3B
+
+hf download Qwen/Qwen2.5-3B-Instruct-GGUF \
+    qwen2.5-3b-instruct-q4_k_m.gguf \
+    --local-dir models/qwen2.5-3B
+```
+
+### Qwen2.5-Coder-3B-Instruct（Q4_K_M GGUF）
+
+```bash
+mkdir -p models/qwen2.5-coder-3B
+
+hf download Qwen/Qwen2.5-Coder-3B-Instruct-GGUF \
+    qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+    --local-dir models/qwen2.5-coder-3B
+```
+
+### Qwen3-4B（Q4_K_M GGUF，实验支持）
+
+```bash
+mkdir -p models/qwen3-4B
+
+hf download Qwen/Qwen3-4B-GGUF \
+    Qwen3-4B-Q4_K_M.gguf \
+    --local-dir models/qwen3-4B
+```
+
 ### DeepSeek-R1-Distill-Qwen-1.5B（Q4_K_M GGUF）
 
 ```bash
@@ -106,6 +136,16 @@ mkdir -p models/deepseek-r1-distill-qwen-1.5B
 hf download QuantFactory/DeepSeek-R1-Distill-Qwen-1.5B-GGUF \
     DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf \
     --local-dir models/deepseek-r1-distill-qwen-1.5B
+```
+
+### Hunyuan-1.8B-Instruct（Q4_K_M GGUF，实验支持）
+
+```bash
+mkdir -p models/hunyuan-1.8B
+
+hf download Edge-Quant/Hunyuan-1.8B-Instruct-Q4_K_M-GGUF \
+    hunyuan-1.8b-instruct-q4_k_m.gguf \
+    --local-dir models/hunyuan-1.8B
 ```
 
 ---
@@ -134,9 +174,37 @@ build/tools/cli/axonforge-cli \
     -p "The capital of France is" -n 64 -t 0.0
 
 build/tools/cli/axonforge-cli \
+    -m models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -p "The capital of France is" -n 64 -t 0.0
+
+build/tools/cli/axonforge-cli \
+    -m models/qwen2.5-coder-3B/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+    -p "Write a Python function that returns the nth Fibonacci number." -n 96 -t 0.0
+
+build/tools/cli/axonforge-cli \
+    -m models/qwen3-4B/Qwen3-4B-Q4_K_M.gguf \
+    -p "What is 2+2? /no_think" -n 64 -t 0.7 --top-k 20 --top-p 0.8 --rep-penalty 1.5
+
+build/tools/cli/axonforge-cli \
     -m models/deepseek-r1-distill-qwen-1.5B/DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf \
     -p "What is 2+2?" -n 64 -t 0.0
 ```
+
+Qwen3 支持仍为 dense Qwen3 的实验路径：当前实现支持 `qwen3` metadata、Qwen BPE tokenizer、Q/K head-wise RMSNorm 和 ChatML 模板；不支持 Qwen3 MoE、Qwen3-Next、Qwen3-VL。
+
+### Hunyuan Dense
+
+```bash
+build/tools/cli/axonforge-cli \
+    -m models/hunyuan-1.8B/hunyuan-1.8b-instruct-q4_k_m.gguf \
+    -p "/no_think What is the capital of France?" -n 64 -t 0.0 -V
+
+build/tools/cli/axonforge-cli \
+    -m models/hunyuan-1.8B/hunyuan-1.8b-instruct-q4_k_m.gguf \
+    --chat -i -n 128 -t 0.7 -V
+```
+
+Hunyuan dense 支持 `hunyuan-dense` metadata、Hunyuan BPE pre-tokenizer、RoPE 后 Q/K head-wise RMSNorm 和混元 dense Chat 模板；不支持 Hunyuan-A13B/Large MoE、VL/OCR/Video/Image。
 
 ---
 
@@ -423,4 +491,8 @@ for (; i + 8 <= n; i += 8)
 | TinyLlama-1.1B-Chat | `models/tinyllama-1.1B/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |
 | LLaMA-2-7B | `models/llama-2-7B/llama-2-7b.Q4_K_M.gguf` |
 | Qwen2.5-0.5B-Instruct | `models/qwen2.5-0.5B/qwen2.5-0.5b-instruct-q4_k_m.gguf` |
+| Qwen2.5-3B-Instruct | `models/qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf` |
+| Qwen2.5-Coder-3B-Instruct | `models/qwen2.5-coder-3B/qwen2.5-coder-3b-instruct-q4_k_m.gguf` |
+| Qwen3-4B | `models/qwen3-4B/Qwen3-4B-Q4_K_M.gguf` |
 | DeepSeek-R1-Distill-Qwen-1.5B | `models/deepseek-r1-distill-qwen-1.5B/DeepSeek-R1-Distill-Qwen-1.5B.Q4_K_M.gguf` |
+| Hunyuan-1.8B-Instruct | `models/hunyuan-1.8B/hunyuan-1.8b-instruct-q4_k_m.gguf` |

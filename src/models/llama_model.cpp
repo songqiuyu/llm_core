@@ -415,6 +415,28 @@ static void rms_norm_out(float* __restrict__ dst,
     for (; i < n; i++) dst[i] = w[i] * src[i] * ss;
 }
 
+static void rms_norm_heads_inplace(float* x,
+                                   const float* w,
+                                   int n_heads,
+                                   int head_dim,
+                                   float eps) noexcept {
+    if (!w) return;
+    for (int h = 0; h < n_heads; ++h)
+        rms_norm_avx2(x + (size_t)h * head_dim, w, head_dim, eps);
+}
+
+static void rms_norm_heads_rows_inplace(float* x,
+                                        const float* w,
+                                        int rows,
+                                        int n_heads,
+                                        int head_dim,
+                                        float eps) noexcept {
+    if (!w) return;
+    const int row_dim = n_heads * head_dim;
+    for (int r = 0; r < rows; ++r)
+        rms_norm_heads_inplace(x + (size_t)r * row_dim, w, n_heads, head_dim, eps);
+}
+
 // ─── Softmax in-place ─────────────────────────────────────────────────────────
 
 static void softmax(float* x, int n) noexcept {
@@ -912,6 +934,8 @@ struct LlamaLayerW {
     const float* attn_norm;   // always F32
     const float* ffn_norm;    // always F32
     WT wq, wk, wv, wo;        // QKV + output projection
+    const float* q_norm{nullptr};
+    const float* k_norm{nullptr};
     const float* bq{nullptr};
     const float* bk{nullptr};
     const float* bv{nullptr};
@@ -923,6 +947,12 @@ struct LlamaWeights {
     const float* output_norm;  // always F32
     WT           output;       // lm head
     std::vector<LlamaLayerW> layers;
+};
+
+enum class QkNormOrder {
+    None,
+    BeforeRope,
+    AfterRope,
 };
 
 // Repack a Q4K_M weight matrix to 8-row interleaved format (same total bytes).
@@ -958,8 +988,10 @@ static LlamaWeights build_weights(const Engine& e, int n_layer,
         std::snprintf(name, sizeof(name), "blk.%d.attn_norm.weight",  l); lw.attn_norm = w_f32(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight",   l); lw.ffn_norm  = w_f32(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.attn_q.weight",     l); lw.wq   = make_wt(e, name);
+        std::snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); if (const Tensor* t = e.weight(name)) lw.q_norm = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_q.bias",       l); if (const Tensor* t = e.weight(name)) lw.bq = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_k.weight",     l); lw.wk   = make_wt(e, name);
+        std::snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l); if (const Tensor* t = e.weight(name)) lw.k_norm = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_k.bias",       l); if (const Tensor* t = e.weight(name)) lw.bk = static_cast<const float*>(t->raw_data());
         std::snprintf(name, sizeof(name), "blk.%d.attn_v.weight",     l); lw.wv   = make_wt(e, name);
         std::snprintf(name, sizeof(name), "blk.%d.attn_v.bias",       l); if (const Tensor* t = e.weight(name)) lw.bv = static_cast<const float*>(t->raw_data());
@@ -1062,6 +1094,7 @@ struct LlamaState {
     // Hyperparameters
     int n_layer, n_ctx, n_embd, n_heads, n_kv_heads, head_dim, n_vocab, ffn_dim;
     float rms_eps, rope_theta;
+    QkNormOrder qk_norm_order{QkNormOrder::None};
 
     // KV cache: [n_layer][n_ctx][n_kv_heads * head_dim]
     int kv_embd;
@@ -1094,10 +1127,12 @@ struct LlamaState {
 
     LlamaState(int nl, int nc, int ne, int nh, int nkv, int nv, int fd,
                float eps, float rtheta, int n_threads,
+               QkNormOrder qk_order,
                ThreadPool* ext_pool = nullptr)
         : n_layer(nl), n_ctx(nc), n_embd(ne), n_heads(nh), n_kv_heads(nkv)
         , head_dim(ne / nh), n_vocab(nv), ffn_dim(fd)
         , rms_eps(eps), rope_theta(rtheta)
+        , qk_norm_order(qk_order)
         , kv_embd(nkv * (ne / nh))
     {
         kv_k.resize((size_t)nl * nc * kv_embd, 0.f);
@@ -1195,10 +1230,21 @@ static void llama_forward_token(int token_id, int pos, LlamaState& s) {
         add_bias(s.q.data(), lw.bq, H   * HD);
         add_bias(s.k.data(), lw.bk, KVH * HD);
         add_bias(s.v.data(), lw.bv, KVH * HD);
+        if (s.qk_norm_order == QkNormOrder::BeforeRope) {
+            rms_norm_heads_inplace(s.q.data(), lw.q_norm, H, HD, s.rms_eps);
+            rms_norm_heads_inplace(s.k.data(), lw.k_norm, KVH, HD, s.rms_eps);
+        }
 
         // ---- RoPE Q in-place; Fusion E: RoPE K + store to cache in one pass ----
         apply_rope(s.q.data(), pos, H, HD, s.rope_cache);
-        rope_and_store_k(s.k_buf(l, pos), s.k.data(), pos, KVH, HD, s.rope_cache);
+        if (s.qk_norm_order == QkNormOrder::AfterRope) {
+            apply_rope(s.k.data(), pos, KVH, HD, s.rope_cache);
+            rms_norm_heads_inplace(s.q.data(), lw.q_norm, H, HD, s.rms_eps);
+            rms_norm_heads_inplace(s.k.data(), lw.k_norm, KVH, HD, s.rms_eps);
+            std::copy(s.k.begin(), s.k.end(), s.k_buf(l, pos));
+        } else {
+            rope_and_store_k(s.k_buf(l, pos), s.k.data(), pos, KVH, HD, s.rope_cache);
+        }
         std::copy(s.v.begin(), s.v.end(), s.v_buf(l, pos));
 
         // ---- GQA multi-head attention (Phase C: AVX2 dot + SAXPY) ----
@@ -1336,12 +1382,25 @@ static void llama_forward_batch(const int32_t* token_ids, int T,
         add_bias_rows(Q.data(), lw.bq, T, H*HD);
         add_bias_rows(K.data(), lw.bk, T, KVH*HD);
         add_bias_rows(V.data(), lw.bv, T, KVH*HD);
+        if (s.qk_norm_order == QkNormOrder::BeforeRope) {
+            rms_norm_heads_rows_inplace(Q.data(), lw.q_norm, T, H, HD, s.rms_eps);
+            rms_norm_heads_rows_inplace(K.data(), lw.k_norm, T, KVH, HD, s.rms_eps);
+        }
 
         // RoPE + KV cache fill: Fusion E — RoPE K directly into cache
         for (int t = 0; t < T; t++) {
             const int pos = pos_start + t;
             apply_rope(Q.data()+(size_t)t*H*HD, pos, H, HD, s.rope_cache);
-            rope_and_store_k(s.k_buf(l,pos), K.data()+(size_t)t*KVH*HD, pos, KVH, HD, s.rope_cache);
+            if (s.qk_norm_order == QkNormOrder::AfterRope) {
+                float* q_row = Q.data() + (size_t)t*H*HD;
+                float* k_row = K.data() + (size_t)t*KVH*HD;
+                apply_rope(k_row, pos, KVH, HD, s.rope_cache);
+                rms_norm_heads_inplace(q_row, lw.q_norm, H, HD, s.rms_eps);
+                rms_norm_heads_inplace(k_row, lw.k_norm, KVH, HD, s.rms_eps);
+                std::copy(k_row, k_row + KVH*HD, s.k_buf(l,pos));
+            } else {
+                rope_and_store_k(s.k_buf(l,pos), K.data()+(size_t)t*KVH*HD, pos, KVH, HD, s.rope_cache);
+            }
             std::copy(V.data()+(size_t)t*KVH*HD, V.data()+(size_t)(t+1)*KVH*HD, s.v_buf(l,pos));
         }
 
@@ -1455,6 +1514,9 @@ std::vector<int32_t> llama_generate(const Engine& engine,
     const float eps    = mc.rms_norm_eps > 0.f ? mc.rms_norm_eps : 1e-5f;
     const float rtheta = mc.rope_theta   > 0.f ? mc.rope_theta   : 10000.f;
     const int FD  = mc.ffn_dim > 0 ? mc.ffn_dim : 4 * E;
+    const QkNormOrder qk_order = mc.arch == "hunyuan-dense"
+        ? QkNormOrder::AfterRope
+        : (mc.arch == "qwen3" ? QkNormOrder::BeforeRope : QkNormOrder::None);
 
     const int n_threads = cfg.n_threads > 0
         ? cfg.n_threads
@@ -1491,7 +1553,7 @@ std::vector<int32_t> llama_generate(const Engine& engine,
     // This eliminates CPU sharing between the serial calling thread and any worker.
     ThreadPool::pin_caller(n_workers);
 
-    LlamaState state(L, NC, E, H, KVH, V, FD, eps, rtheta, n_threads, s_pool.get());
+    LlamaState state(L, NC, E, H, KVH, V, FD, eps, rtheta, n_threads, qk_order, s_pool.get());
     state.weights = s_wt_cache;  // O(1): shared_ptr refcount bumps only
     std::mt19937 rng(42);
 

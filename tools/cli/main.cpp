@@ -32,6 +32,7 @@
 #include "axonforge/models/gpt2.hpp"
 #include "axonforge/models/llama.hpp"
 #include "axonforge/models/qwen2.hpp"
+#include "axonforge/models/hunyuan_dense.hpp"
 #include "axonforge/dtype.hpp"
 #include <chrono>
 #include <cstdio>
@@ -120,11 +121,14 @@ static void print_usage(const char* prog) {
 
 // ── Chat template helpers ──────────────────────────────────────────────────────────────────────────────
 
-enum class ChatFmt { Raw, Zephyr, LLaMA2, ChatML };
+enum class ChatFmt { Raw, Zephyr, LLaMA2, ChatML, HunyuanDense };
 
-static ChatFmt detect_chat_fmt(const std::string& tmpl) noexcept {
+static ChatFmt detect_chat_fmt(const std::string& tmpl, const std::string& arch) noexcept {
+    if (arch == "hunyuan-dense")                         return ChatFmt::HunyuanDense;
     if (tmpl.empty())                                      return ChatFmt::Raw;
     if (tmpl.find("<|im_start|>")  != std::string::npos) return ChatFmt::ChatML;
+    if (tmpl.find("<\xEF\xBD\x9Chy_User\xEF\xBD\x9C>") != std::string::npos)
+        return ChatFmt::HunyuanDense;
     if (tmpl.find("<|system|>")    != std::string::npos) return ChatFmt::Zephyr;
     if (tmpl.find("[INST]")                        != std::string::npos) return ChatFmt::LLaMA2;
     return ChatFmt::Raw;
@@ -195,6 +199,32 @@ static std::string format_chat(ChatFmt fmt,
         break;
     }
 
+    case ChatFmt::HunyuanDense: {
+        static const char* HY_USER   = "<\xEF\xBD\x9Chy_User\xEF\xBD\x9C>";
+        static const char* HY_ASST   = "<\xEF\xBD\x9Chy_Assistant\xEF\xBD\x9C>";
+        static const char* HY_END    = "<\xEF\xBD\x9C" "hy_place" "\xE2\x96\x81" "holder" "\xE2\x96\x81" "no" "\xE2\x96\x81" "2" "\xEF\xBD\x9C" ">";
+        static const char* HY_SYSEND = "<\xEF\xBD\x9C" "hy_place" "\xE2\x96\x81" "holder" "\xE2\x96\x81" "no" "\xE2\x96\x81" "3" "\xEF\xBD\x9C" ">";
+        if (!system_msg.empty()) {
+            out += system_msg;
+            out += HY_SYSEND;
+        }
+        for (const auto& msg : history) {
+            if (msg.role == "user") {
+                out += HY_USER;
+                out += msg.text;
+                out += HY_ASST;
+            } else {
+                out += HY_ASST;
+                out += msg.text;
+                out += HY_END;
+            }
+        }
+        out += HY_USER;
+        out += user_msg;
+        out += HY_ASST;
+        break;
+    }
+
     default:
         out = user_msg;
         break;
@@ -220,7 +250,7 @@ static void dispatch_generate(const axonforge::Engine& engine,
         cfg.top_k          = top_k;
         cfg.on_token       = std::move(on_token);
         axonforge::gpt2_generate(engine, prompt_ids, cfg);
-    } else if (arch == "qwen2") {
+    } else if (arch == "qwen2" || arch == "qwen3") {
         axonforge::Qwen2Config cfg;
         cfg.max_new_tokens = max_new_tokens;
         cfg.temperature    = temperature;
@@ -230,6 +260,16 @@ static void dispatch_generate(const axonforge::Engine& engine,
         cfg.n_threads      = n_threads;
         cfg.on_token       = std::move(on_token);
         axonforge::qwen2_generate(engine, prompt_ids, cfg);
+    } else if (arch == "hunyuan-dense") {
+        axonforge::HunyuanDenseConfig cfg;
+        cfg.max_new_tokens = max_new_tokens;
+        cfg.temperature    = temperature;
+        cfg.top_k          = top_k;
+        cfg.top_p          = top_p;
+        cfg.rep_penalty    = rep_penalty;
+        cfg.n_threads      = n_threads;
+        cfg.on_token       = std::move(on_token);
+        axonforge::hunyuan_dense_generate(engine, prompt_ids, cfg);
     } else {
         axonforge::LlamaConfig cfg;
         cfg.max_new_tokens = max_new_tokens;
@@ -545,7 +585,7 @@ int main(int argc, char* argv[]) {
 
         if (interactive) {
             const ChatFmt fmt = chat_mode
-                ? detect_chat_fmt(engine.chat_template())
+                ? detect_chat_fmt(engine.chat_template(), engine.model_config().arch)
                 : ChatFmt::Raw;
             if (chat_mode && fmt == ChatFmt::Raw)
                 std::fprintf(stderr,
